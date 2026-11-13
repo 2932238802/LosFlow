@@ -32,6 +32,10 @@ $obj = [ordered]@{
         'ds-taskboard' = [ordered]@{
             command = $cfg.nodeExe
             args    = @($server)
+            env     = [ordered]@{
+                LOSFLOW_DATA            = $cfg.progressDir
+                LOSFLOW_CONNECTORS_FILE = (Join-Path $cfg.progressDir 'connectors.json')
+            }
         }
     }
 }

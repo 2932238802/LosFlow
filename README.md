@@ -2,7 +2,7 @@
 
 **定位：DSH 插件 + 工作流驾驶舱。** 把「提需求 → 拆任务 → 派给 Claude Code → 看它干 → 收授权 → 台账落文档」这一整条流水线做成看得见、管得住的一处。
 
-不是另一个聊天框，而是 DSH 右边那块**干活的面板**：任务池、会话回放、授权队列、腾讯文档同步。
+不是另一个聊天框，而是 DSH 右边那块**干活的面板**：任务池、会话回放、授权队列、可插拔的文档同步连接器。
 
 ## 一条任务的生命
 
@@ -65,8 +65,22 @@ npm run smoke     # 起临时端口，断言 /api/state、/api/docsync、/app/�
 | WSL2（默认 `Ubuntu-26.04`）+ `/usr/bin/start_claude_code_jz` | WSL2 项目的 Claude Code（one-api 网关） | 派 WSL2 项目时才需要 |
 | Windows 的 Claude Code（`claude.exe` ≥ 2.1.0） | Windows 项目的 Claude Code（同一网关） | 派 Windows 项目时才需要 |
 | Python 3（WSL 自带 `python3`；Windows 用 `py -3` 或配置 `pythonCmd`） | 实时授权 MCP（`agent/approval-mcp.py`），把 Claude Code 的「问人」接到会话右上悬浮卡 + Windows 提醒 | 实时授权时需要；`liveApprove:false` 可退回旧的事后审批 |
-| WorkBuddy + 腾讯文档连接器 | 写任务表、消费文档同步队列 | 文档同步才需要 |
+| WorkBuddy + 腾讯文档连接器 | 写任务表、消费文档同步队列（`tencent-wb`） | 文档同步才需要；也可改用 `local-file` / `http-webhook` |
 | DSH | 承载右侧栏插件 | 用面板才需要 |
+
+## 连接器（文档同步）
+
+文档同步不再是「写死一张腾讯文档表」，而是按连接器 fan-out：
+
+| 连接器 | 形态 | 作用 | 默认 |
+| --- | --- | --- | --- |
+| `tencent-wb` | executor | 把 append-row / update-row / cleanup 翻译成人话，WorkBuddy 通过 `next_docsync` 取走执行 | 启用 |
+| `local-file` | direct | 直接写 `data/ledger/<project>.md`，不依赖 WorkBuddy | 关闭 |
+| `http-webhook` | direct | POST JSON 到自建端点（n8n / 飞书机器人等），token 存 `data/secrets.json` | 关闭 |
+
+- 配置在 `data/connectors.json`（可热改，不进 git）；设置页「连接器」可改目标地址 / 字段映射 / 动作 / 重试，支持「发测试行」「重放失败」。
+- 连接器包在 `server/connectors/<id>/`：`connector.json`（manifest）+ `index.mjs`（`export default { apply(host) }`）。只加载已启用连接器的代码。
+- 同一动作会发给**所有启用且支持该动作**的连接器，各队列独立重试，一个失败不影响另一个。
 
 两边**互不干涉**：各用各的 CLI、配置、会话、进程与临时文件；WSL 停掉不影响 Windows 派单，反之亦然。
 
@@ -104,7 +118,10 @@ Windows 侧配置（`losflow.config.json`，gitignored）：
 | --- | --- |
 | `pool.json` | 任务池 |
 | `Vesta.tasks.json` | 任务表（唯一真源） |
-| `docsync.json` | 文档同步队列（异步回调） |
+| `docsync.json` | 文档同步队列（每条 job 带 `connector`；executor/direct 各自重试） |
+| `connectors.json` | 连接器配置（target / mapping / actions / queue；可热改，不进 git） |
+| `secrets.json` | 连接器密钥（目前是 webhook token；只给连接器读） |
+| `ledger/` | `local-file` 连接器的 Markdown 台账 |
 | `approvals.json` / `allowlist.json` | 授权队列与已放行规则（`live:true` 为执行前实时请求） |
 | `live/` | 实时授权的文件握手：`<id>.req.json`（MCP 写）/ `<id>.res.json`（服务端写），结案进 `live/archive/` |
 | `claude-ledger.jsonl` | 派单台账（花费/轮次/回执摘要） |

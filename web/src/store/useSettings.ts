@@ -1,6 +1,6 @@
 import { reactive, ref } from "vue";
 import { getJSON, post } from "../api";
-import { busy, refresh } from "./useAppState";
+import { busy, refresh, s as appState } from "./useAppState";
 import { flash } from "./useToast";
 
 export const threshold = ref(5);
@@ -56,9 +56,10 @@ export async function saveThreshold() {
 }
 
 export function buildCronPrompt() {
+  const url = (appState.value?.connectors || []).find((c) => c.kind === "executor" && c.enabled)?.target?.url || "";
   cronPrompt.value = [
     "【每天的整理动作】",
-    "1) 打开腾讯文档任务表：https://docs.qq.com/sheet/DZVFSeURwdmVJdVZL?tab=BB08J2",
+    url ? `1) 打开文档：${url}` : "1) 打开当前启用的文档连接器对应的表格",
     "2) 主表里任务状态为「已完成」或「已搁置」的行，移到「归档」tab（没有就建，并复制表头）",
     "3) 只动数据行，不动表头、序号公式、格式、筛选、隐藏列",
     "4) 移完读回核对：主表剩几行、归档有几行，用 report_task 回填结果",

@@ -42,12 +42,24 @@ try {
   check("state 不再带 stage / dispatches", !("stage" in state) && !("dispatches" in state) && !("stages" in state));
   check("state.tasks[].run 不带回执全文", (state.tasks || []).every((t) => !t.run || !("result" in t.run)));
   check("state.docsync 存在", !!state.docsync, `pending=${state.docsync?.pending}`);
+  check("state.docsync 带 byConnector", !!state.docsync?.byConnector && typeof state.docsync.byConnector === "object");
+  check("state.connectors 存在", Array.isArray(state.connectors) && state.connectors.length > 0, `n=${state.connectors?.length}`);
+  check(
+    "connector 带 enabled/target/queue",
+    (state.connectors || []).every((c) => typeof c.enabled === "boolean" && !!c.target && !!c.queueStats)
+  );
   check("state.notify 存在", !!state.notify && typeof state.notify.enabled === "boolean", `ok=${state.notify?.ok} mode=${state.notify?.mode}`);
   check("state.terminals 存在", !!state.terminals, `count=${state.terminals?.count}`);
   check("state.history 存在", !!state.history, `runs=${state.history?.runs}`);
 
   const doc = await get("/api/docsync");
   check("GET /api/docsync", typeof doc.pending === "number");
+  const conn = await get("/api/connectors");
+  check("GET /api/connectors", Array.isArray(conn.connectors) && conn.connectors.length > 0, `n=${conn.connectors?.length}`);
+  check(
+    "连接器不返回密钥值",
+    (conn.connectors || []).every((c) => !("token" in c) && !("secret" in c))
+  );
 
   // 后台作业契约（拆分）：列表在、未知 id 给 404，不让前端无限转圈
   const jobList = await get("/api/jobs?kind=pool.suggest");

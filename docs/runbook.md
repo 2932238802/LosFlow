@@ -34,6 +34,14 @@ update.bat --force           # 端口被别的进程占 / 有任务在跑时也�
 - 关闭：`losflow.config.json` 的 `notify.enabled=false`（或环境变量 `LOSFLOW_NOTIFY=0`）；设置页会显示「Windows 提醒：开 / 关 / 不可用（原因）」。
 - 非 Windows 平台不弹、不报错。
 
+### 文档连接器
+
+- 配置：`data/connectors.json`（首次启动自动生成默认值）；密钥：`data/secrets.json`（只给连接器读，接口/日志不返回）。
+- 设置页「连接器」可启用/关闭、改目标地址与字段映射、发测试行、重放失败；健康与积压数也在这里。
+- 内置：`tencent-wb`（executor，WorkBuddy 取 `next_docsync` 执行）、`local-file`（direct，写 `data/ledger/`）、`http-webhook`（direct，POST JSON）。
+- 关闭所有连接器后：推入仍会建任务，但不入文档队列，界面会提示「没有启用的文档连接器」；已有队列仍保留，重新启用后可被取走 / 重放。
+- 新增连接器：在 `server/connectors/<id>/` 放 `connector.json` + `index.mjs`（`export default { apply(host) }`），然后重启或在设置页启用；只加载已启用连接器的代码。
+
 ## 常见故障
 
 | 现象 | 先查 |

@@ -6,7 +6,7 @@
 | 日期 | 2026-11-13 |
 | 项目 | LosFlow（`D:\PROJECT\LosFlow`） |
 | 类型 | 配置模型 + 连接器插件化（后端为主，前端设置页 + 少量派单分流） |
-| 状态 | 方案待确认（未实施） |
+| 状态 | 已实施（A2 配置模型 + connector host + 3 个内置连接器 + 设置页） |
 | 提出 | 杰哥（2026-11-13：「当前的 WorkBuddy 是写死的哪个文档对么？然后我们默认也只能对接很小一部分功能；增加自定义设置以及多种对接方式，类似 DSH 那种插件模式」） |
 | 涉及文件 | `server/docsync.mjs`、`server/connectors/*`（新增）、`server/connector-host.mjs`（新增）、`server/server.mjs`、`server/paths.mjs`、`agent/wb-bridge/server.mjs`、`agent/sync-mcp.ps1`、`agent/taskboard.ps1`、`web/src/views/SettingsView.vue`、`web/src/store/useSettings.ts`、`web/src/store/useTasks.ts`、`losflow.config.example.json`、`docs/api.md`、`docs/architecture.md`、`README.md`、`agent/wb-bridge/README.md`、`scripts/smoke.mjs` |
 
@@ -282,3 +282,14 @@ export default { apply(host) { /* 注册 describe / write / health */ } };
 ## 变更记录
 
 - 2026-11-13 初稿：现状核对（10 类写死项 + 行号，含同一个 URL 抄 4 处、`docUrl` 死参数、`taskboard.ps1` 重复正则、README 旧路径与「4 个工具」过期）、能力天花板对照、现场数据（5 条 pending / `docSyncedAt` 0 / 最后一次调用 17:17）、配置模型 A1/A2、连接器 SPI（executor / direct 两形态 + `host` 能力 + 动态 MCP 工具 + 管理面）、三个内置连接器、迁移与验收 9 条、风险 9 条、排期 3.5 天。
+
+- 2026-11-13 实施（A2 + SPI + 三个内置连接器）：
+  - **配置模型 A2**：`data/connectors.json`（可热改、不进 git）；`data/secrets.json` 只存密钥；`server/paths.mjs` 增 `connectorsDir/connectorsFile/secretsFile/ledgerDir`。
+  - **connector-host**：扫描 `server/connectors/<id>/connector.json`，只加载启用连接器的 `index.mjs`；配置合并/保存、密钥（只回 `hasSecret`）、健康（lastOk/lastError/action/jobId）、`matchDocInstruction`、`enqueueTargets`、`describe`。
+  - **内置连接器**：`tencent-wb`（executor：match + describe，URL/tab/列名来自配置，默认行为不变）；`local-file`（direct：`data/ledger/<project>.md` 追加/改行/probe）；`http-webhook`（direct：POST JSON + Bearer token + 超时）。
+  - **docsync**：队列 job 带 `connector/connectorKind/targetSnapshot/mappingSnapshot/queue`；按动作 fan-out 到所有启用连接器；executor 走 `nextJob/report`，direct 由 worker 执行、按 `maxAttempts` 重试；`replay/replayFailed`；启动迁移（补 connector/target、未知动作标 failed、备份 `.bak`）；`byConnector` 摘要。
+  - **MCP**：`next_docsync` 支持 `connector` 过滤并返回 `connector:` 首行；`tools/list` 无 executor 时隐藏 next/report；`report_docsync` 不变；`add_task` 走连接器 match 判定。
+  - **设置页**：连接器列表 + 启用开关 + 目标地址 / 动作 / 字段映射 / 重试 / token；健康、积压、失败数；[发测试行] [重放失败]；密钥永不回显。
+  - **其他**：`taskboard.ps1` 的重复正则改为 `server/cli/docsync-check.mjs`（node 不可用时回落）；`sync-mcp.ps1` 注入 `LOSFLOW_DATA` / `LOSFLOW_CONNECTORS_FILE`；smoke 增加连接器契约检查；README / api / architecture / wb-bridge README 同步。
+  - 验证：临时数据目录实测 fan-out（local-file + http-webhook 各一条）、webhook 成功 / 失败 / 重放、local-file 台账写入、连接器禁用后不再入队、队列迁移（5 条 pending 自动补 `tencent-wb` + `.bak`）；wb-bridge `tools/list` 动态隐藏；typecheck / build / smoke 全绿。
+  - 未做：官方腾讯文档 API 直连、多连接器同目标串行锁（R5 仍按 target 人工约束）、积压超时告警（二期）。

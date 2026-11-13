@@ -259,8 +259,10 @@ export async function doPush() {
     const n = (r.created || []).length;
     const docN = (r.docsync || []).length;
     const auto = r.autoStarted || [];
+    const anyConnector = (s.value?.connectors || []).some((c) => c.enabled);
     flash(
       `已推入 ${n} 条${docN ? ` · 文档同步排队 ${docN} 条` : ""}` +
+        (!anyConnector ? " · 没有启用的文档连接器，未入文档队列" : "") +
         (auto.length ? ` · 已自动开工 ${auto.map((x: string) => "#" + x).join(" ")}` : " · WorkBuddy 任务等 WB 取走")
     );
     refresh();

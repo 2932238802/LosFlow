@@ -1,0 +1,16 @@
+{
+  "manifestVersion": 1,
+  "id": "http-webhook",
+  "kind": "direct",
+  "version": "1.0.0",
+  "label": { "zh": "HTTP Webhook", "en": "HTTP Webhook" },
+  "capabilities": ["append-row", "update-row", "cleanup", "probe"],
+  "secrets": ["token"],
+  "match": { "urlPatterns": [], "keywords": [] },
+  "defaultConfig": {
+    "enabled": false,
+    "target": { "url": "" },
+    "actions": ["append-row", "update-row", "cleanup", "probe"],
+    "queue": { "maxAttempts": 3, "staleMs": 900000, "timeoutMs": 8000 }
+  }
+}

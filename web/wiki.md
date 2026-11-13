@@ -74,25 +74,27 @@ Claude Code 想执行但被权限拦住时，**会话右上角**会浮出授权�
 
 **关键点：所有信息都能从这几个文件推导出来，不需要进 WSL 看。**
 
-## 三半、文档同步队列（异步）
+## 三半、文档同步队列（连接器）
 
-腾讯文档任务表那一行**不再挡开工**，它是一条独立的异步活：
+文档同步不再是「写死一张腾讯文档表」，而是按**连接器** fan-out；任务本体落库不受影响：
 
 ```
 推入 → 任务本体落库（立即可派给工作 Agent）
-     └─ 同时 docsync.enqueue()：一条「写主表一行、状态=开发中」的活
-          → WorkBuddy 定时来取（MCP 工具 next_docsync），写表格
-          → 写完回调（report_docsync / POST /api/docsync/report）
-          → 面板显示已同步；失败按 3 次重试，超时 15 分钟自动退回队列
+     └─ docsync.enqueue()：每个启用且支持 append-row 的连接器各一条 job
+          ├─ executor（tencent-wb）→ WorkBuddy 定时取 next_docsync，写完 report_docsync
+          └─ direct（local-file / http-webhook）→ server 直接执行，按连接器重试
+          → 面板显示已同步；失败进 failed，可「重放失败」
 ```
 
-- 队列文件：`_progress/docsync.json`
-- **动作**：`append-row`（推入时写一行「开发中」）、`update-row`（标记完成时回填状态/备注）、`cleanup`（整理主表：已完成/已搁置移到「归档」）。维护动作同样只入队，不建任务行。
-- **写文档不占任务行**：点「整理主表」或自动整理到阈值，都只往 `docsync` 入队（`action:"cleanup"`），任务池 / 任务页 / 会话页都不出现条目；`taskboard.ps1 -Add` 与 wb-bridge `add_task` 传腾讯文档操作指令会被拒建，提示走本队列。
-- **回调 done 之后**：任务表里该条打上 `docSyncedAt`，面板上任务卡进度条 `10% → 30%`（台账就绪，等开工），全局阶段条 `② 需求 → ③ 任务表`；没有文档同步要求的任务（WB 自己的文档活）不算卡点。
-- 面板接口：`GET /api/docsync`（只读摘要）；回调 `POST /api/docsync/report`（带 `x-dash: 1`）
-- MCP 工具：`next_docsync`（取一条，标 running）、`report_docsync`（done / failed）；`add_task` 收到文档操作指令会拒建（该走队列）。
-- **WorkBuddy 侧要建一个 10–30 分钟的定时任务**：`next_docsync` → 有活就写 → `report_docsync`。没建就会一直排队，但**不影响任何任务开工**。
+- 队列文件：`data/docsync.json`（每条 job 带 `connector` / `targetSnapshot` / `queue`）。
+- 连接器配置：`data/connectors.json`；密钥：`data/secrets.json`；设置页「连接器」可改目标 / 字段映射 / 动作 / 重试，发测试行、重放失败。
+- 内置：`tencent-wb`（默认启用，行为与旧版一致）、`local-file`（写 `data/ledger/<project>.md`）、`http-webhook`（POST JSON，可带 token）。
+- **动作**：`append-row`（推入时写一行「开发中」）、`update-row`（标记完成时回填状态/备注）、`cleanup`（整理主表 / 台账）。维护动作同样只入队，不建任务行。
+- **写文档不占任务行**：点「整理主表」或自动整理到阈值，都只往 docsync 入队；`taskboard.ps1 -Add` 与 wb-bridge `add_task` 传文档操作指令会被拒建。
+- **回调 done 之后**：任务表里该条打上 `docSyncedAt`，任务卡进度条 `10% → 30%`。
+- 面板接口：`GET /api/docsync`、`GET /api/connectors`；回调 `POST /api/docsync/report`；连接器设置 `POST /api/connectors`。
+- MCP 工具：`next_docsync`（取一条，标 running；可传 `connector`）、`report_docsync`（done / failed）；没有启用的 executor 时这两个工具不出现在 `tools/list`。
+- **WorkBuddy 侧要建一个 10–30 分钟的定时任务**：`next_docsync` → 有活就写 → `report_docsync`。没建就会一直排队，但**不影响任何任务开工**；即使 WorkBuddy 完全停摆，`local-file` 仍能留痕。
 
 ## 三·六、人验收：会话里的「标记完成」
 

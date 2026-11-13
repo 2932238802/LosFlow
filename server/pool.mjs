@@ -261,11 +261,21 @@ export async function pushPool({ id, priority }) {
   if (!created.length) throw new Error("这条池条目没有可推入的任务");
 
   // 文档同步：一条任务一条，备注用**这条任务自己的正文**，不是父条目的
-  const docJobs = await Promise.all(
-    created.map((t) =>
-      docsync.enqueue({ taskId: t.id, subject: t.subject, priority: pri, status: "开发中", note: t.note })
+  // 每个启用且支持 append-row 的连接器各一条 job（fan-out）
+  const docJobs = (
+    await Promise.all(
+      created.map((t) =>
+        docsync.enqueue({
+          taskId: t.id,
+          subject: t.subject,
+          priority: pri,
+          status: "开发中",
+          note: t.note,
+          project: t.repo || it.project || "",
+        })
+      )
     )
-  );
+  ).flat();
 
   const patches = new Map(targets.map((t, i) => [String(t.id), created[i]]));
   await mutate(poolFile(), (cur) => {

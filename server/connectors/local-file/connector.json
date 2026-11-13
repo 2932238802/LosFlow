@@ -1,0 +1,15 @@
+{
+  "manifestVersion": 1,
+  "id": "local-file",
+  "kind": "direct",
+  "version": "1.0.0",
+  "label": { "zh": "本地台账（Markdown）", "en": "Local ledger (Markdown)" },
+  "capabilities": ["append-row", "update-row", "cleanup", "probe"],
+  "match": { "urlPatterns": [], "keywords": [] },
+  "defaultConfig": {
+    "enabled": false,
+    "target": { "dir": "data/ledger" },
+    "actions": ["append-row", "update-row", "cleanup", "probe"],
+    "queue": { "maxAttempts": 3, "staleMs": 900000 }
+  }
+}

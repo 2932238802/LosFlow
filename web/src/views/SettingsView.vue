@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted } from "vue";
 import AuthRail from "../components/AuthRail.vue";
+import ConnectorsPanel from "../components/ConnectorsPanel.vue";
 import { busy, s } from "../store/useAppState";
 import { delProj, openProj } from "../store/useProjects";
 import {
@@ -57,6 +58,8 @@ const notifyText = computed(() => {
     <summary style="cursor:pointer">最近 {{ (s?.approvals || []).length }} 条（含已批准 / 拒绝 / 超时）</summary>
     <div style="margin-top:16px"><AuthRail history /></div>
   </details>
+
+  <div style="margin-top:44px"><ConnectorsPanel /></div>
 
   <div class="hd" style="margin-top:44px">项目 <b>{{ s?.projects?.length || 0 }}</b></div>
   <div v-for="pr in s?.projects || []" :key="pr.id" class="card" style="padding:14px 0">

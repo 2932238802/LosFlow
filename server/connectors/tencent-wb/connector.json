@@ -1,0 +1,29 @@
+{
+  "manifestVersion": 1,
+  "id": "tencent-wb",
+  "kind": "executor",
+  "version": "1.0.0",
+  "label": { "zh": "腾讯文档任务表（WorkBuddy 执行）", "en": "Tencent Docs board (WorkBuddy)" },
+  "capabilities": ["append-row", "update-row", "cleanup", "probe"],
+  "match": {
+    "urlPatterns": ["docs\\.qq\\.com"],
+    "keywords": ["append-row", "update-row", "腾讯文档任务表", "整理(腾讯文档)?主表"]
+  },
+  "defaultConfig": {
+    "enabled": true,
+    "target": {
+      "url": "https://docs.qq.com/sheet/DZVFSeURwdmVJdVZL?tab=BB08J2",
+      "tab": "BB08J2",
+      "archiveTab": "归档"
+    },
+    "mapping": {
+      "title": "任务",
+      "status": "任务状态",
+      "note": "备注",
+      "priority": "优先级",
+      "serialFormula": true
+    },
+    "actions": ["append-row", "update-row", "cleanup", "probe"],
+    "queue": { "maxAttempts": 3, "staleMs": 900000 }
+  }
+}

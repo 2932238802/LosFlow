@@ -19,18 +19,18 @@ import { dirname, join } from "node:path";
 import { loadPaths } from "../../server/paths.mjs";
 import { mutate } from "../../server/store.mjs";
 import * as docsync from "../../server/docsync.mjs";
-import { fileURLToPath } from "node:url";
-const DATA_DIR = join(fileURLToPath(new URL("../../data/", import.meta.url)));
+import * as connectors from "../../server/connector-host.mjs";
 
 const PATHS = loadPaths();
-docsync.initDocsync(PATHS);
+await connectors.initConnectors(PATHS);
+docsync.initDocsync(PATHS, { worker: false });
 
 const TASKS_FILE =
-  process.env.WB_TASKS_FILE || join(DATA_DIR, "Vesta.tasks.json");
+  process.env.WB_TASKS_FILE || join(PATHS.dataDir, "Vesta.tasks.json");
 
 // 调用日志：确认 WorkBuddy 到底有没有真的调过来
 const CALL_LOG =
-  process.env.WB_CALL_LOG || join(DATA_DIR, "calls.jsonl");
+  process.env.WB_CALL_LOG || join(PATHS.dataDir, "calls.jsonl");
 
 function logCall(entry) {
   try {
@@ -173,38 +173,18 @@ const tools = [
   {
     name: "next_docsync",
     description:
-      "取一条待写的腾讯文档同步任务（异步队列），标记为 running 并返回要写的内容。动作可能是 append-row（追加一行）、update-row（回填已有行）或 cleanup（整理主表）。没有任务时返回「暂无文档同步任务」。写完必须调 report_docsync 回执。",
-    inputSchema: { type: "object", properties: {}, additionalProperties: false },
-    run: async () => {
-      const j = await docsync.nextJob();
+      "取一条待写的文档同步任务（异步队列），标记为 running 并返回要写的内容。可传 connector 只取某个连接器的活；返回第一行带 connector: <id>。没有任务时返回「暂无文档同步任务」。写完必须调 report_docsync 回执。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        connector: { type: "string", description: "只取这个连接器的任务（可选，例如 tencent-wb）" },
+      },
+      additionalProperties: false,
+    },
+    run: async (args = {}) => {
+      const j = await docsync.nextJob(args.connector || "");
       if (!j) return "暂无文档同步任务。";
-      if (j.action === "cleanup") {
-        return [
-          `文档同步 #${j.id}（整理主表 · 第 ${j.attempts} 次尝试）`,
-          `表格：${j.docUrl}`,
-          j.payload.note || "动作：整理主表 —— 把已完成/已搁置的行移到归档 tab。",
-          "写完用 report_docsync 回执：{id, status: \"done\", evidence: 移动行数+读回校验}",
-          "做不到就回填 failed，写清卡在哪一步 + 报错原文（会自动重试）。",
-        ]
-          .filter(Boolean)
-          .join("\n");
-      }
-      const isUpdate = j.action === "update-row";
-      return [
-        `文档同步 #${j.id}（对应任务 #${j.taskId}·第 ${j.attempts} 次尝试）`,
-        `表格：${j.docUrl}`,
-        isUpdate
-          ? "动作：update-row —— 在主表「任务」列找到名称等于下面任务的那一行（有多行取最后一行），只改【任务状态】和【备注】两列；找不到这一行就按 append-row 追加一行。不要动其他行、列、公式、格式"
-          : "动作：append-row —— 在主表末尾追加一行；序号列不手写（沿用已有公式）",
-        `任务：${j.payload.subject}`,
-        `任务状态：${j.payload.status}`,
-        j.payload.priority ? `优先级：${j.payload.priority}` : "",
-        j.payload.note ? `备注：${j.payload.note}` : "",
-        "写完用 report_docsync 回执：{id, status: \"done\", evidence: 行号+读回校验}",
-        "做不到就回填 failed，写清卡在哪一步 + 报错原文（会自动重试）。",
-      ]
-        .filter(Boolean)
-        .join("\n");
+      return docsync.describeJob(j);
     },
   },
   {
@@ -293,11 +273,13 @@ async function handle(msg) {
   if (method === "notifications/initialized" || method === "initialized") return;
 
   if (method === "tools/list") {
+    const canSync = docsync.hasExecutors();
+    const visible = tools.filter((t) => !["next_docsync", "report_docsync"].includes(t.name) || canSync);
     send({
       jsonrpc: "2.0",
       id,
       result: {
-        tools: tools.map((t) => ({
+        tools: visible.map((t) => ({
           name: t.name,
           description: t.description,
           inputSchema: t.inputSchema,

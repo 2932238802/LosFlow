@@ -32,7 +32,9 @@
 | `store.mjs` | `data/*.json` 的统一读写：`readJson` / `mutate`（进程内写入串行 + 临时文件 rename 原子替换） | 业务字段 |
 | `pool.mjs` | 任务池 CRUD、工作类型、拆分、推入 | 派单、文档同步 |
 | `skills.mjs` | 提示词 SKILL（`docs/skills/*.md`）：frontmatter 校验、占位符渲染、保存/备份/恢复默认 | 调 AI |
-| `docsync.mjs` | 文档同步队列（enqueue / enqueueMaintenance / next / report / 重试 / 文档指令判定） | 真去写表格（那是 WorkBuddy） |
+| `docsync.mjs` | 文档同步队列（连接器 fan-out / executor 取活 / direct 执行 / 重试 / 重放 / 迁移） | 真去写表格（executor 是外部 agent，direct 是连接器自己） |
+| `connector-host.mjs` | 连接器注册表：扫描 `server/connectors/<id>/connector.json`、manifest 校验、按启用状态加载 `index.mjs`、配置/密钥/健康 | 具体写表逻辑 |
+| `connectors/*` | 内置连接器：`tencent-wb`（executor，WorkBuddy 执行）/ `local-file`、`http-webhook`（direct，本进程执行） | — |
 | `dispatch.mjs` | 调 `agent/claude-dispatch.ps1`、解析回执、终止、per-run 运行态（`data/runstate`） | 决定派什么 |
 | `env.mjs` | 派单环境判定 `resolveEnv(path, explicit, defaultEnv)`（与 `agent/_paths.ps1` 同规则） | 执行 |
 | `approvals.mjs` | 授权队列：live 实时请求（`data/live` 文件握手，批准当场放行同一次 run）/ legacy 事后审批（写 allowlist + 自动重派）/ 运行中拒绝兜底；新请求入队时触发 Windows 提醒 | 判断权限是否合理 |
@@ -98,7 +100,8 @@ web/src/
 - **会话流**：一条 `GET /events/losflow` 多路复用（最多 8 条任务，`taskId` 区分），服务端按 runId 增量读 stream-json，只消费完整行，附带 `seq`；不再每张卡一条 SSE / 每 2s 整包重取。
 - **流文件解析**（`events.resolveRunFile`）：`data/streams/<id>.jsonl`（archive）→ runstate 里记录的 stream（运行中，source=`wsl`/`windows`）→ `data/runstate/<id>.stream.jsonl` → WSL `/tmp/cc-<id>.stream.jsonl`（旧数据）→ `missing`。实时 SSE 与历史回放共用同一条解析；派单结束后 Windows 的临时流归档并删除。
 - **轮 + 动作契约（兼容保留）**：`GET /api/task/raw?v=2` 仍返回 `rounds[] / stats / end`（每条 assistant 消息一轮、`tool_use` 与 `tool_result` 按 `tool_use_id` 配对），供验收/摘要兼容；会话页渲染改用同响应里的 `lines[]`。默认最后 40 轮，`before` 往前翻；`after` / `beforeSeq` 按行 seq 增量对账；单响应 2 MB 上限。回放源见上一条；`/api/task/stream` 下载原始日志。回执缺金额时 `end.cost = null`，前端显示「—」。
-- **写文档不占任务行**：append-row / update-row / 整理主表只走 `docsync` 队列 → WorkBuddy，不建任务、不进任务池、不进会话、不派给 Claude Code。新建任务入口（`taskboard.ps1 -Add`、wb-bridge `add_task`）命中文档操作指令直接拒建；`/api/task/dispatch`、`/api/task/continue` 对 `docOnly` 任务直接 400 兜底。
+- **写文档不占任务行**：append-row / update-row / 整理主表按**启用连接器 fan-out**；executor（tencent-wb）走 `docsync` 队列由 WorkBuddy 取走，direct（local-file / http-webhook）由 server 直接执行并各自重试。新建任务入口（`taskboard.ps1 -Add`、wb-bridge `add_task`）命中文档操作指令直接拒建；`/api/task/dispatch`、`/api/task/continue` 对 `docOnly` 任务直接 400 兜底。
+- **连接器**：`data/connectors.json` 存配置（target / mapping / actions / match / queue），`data/secrets.json` 只存密钥；`/api/connectors` 增删改 / 测试行 / 重放失败，`/api/state.connectors` 带健康与队列统计。代码里不再出现具体表格 URL、tab id、列名——都在 tencent-wb 的默认配置里，设置页可改。
 - **派单回执 ≠ 任务完成**：回执只说明 Claude 跑完了。人在会话页点「标记完成」，经 `POST /api/task/status` 写 `done` + 区域/证据（工作类型沿用入池时定的值）；`done` 时给 docsync 入队一条 `update-row`（WorkBuddy 按任务名改主表状态与备注），并触发自动整理计数（`docOnly` 任务不计入）。
 - **推入 = 两条线，且立刻派单**：任务本体落库后，Claude Code 任务自动派单（提示词就是 `note`），WorkBuddy 任务等 WB 取走；文档那一行进 `docsync` 队列，异步回调后再推进。
 - **会话渲染单位**：一条连续平铺日志（`lines[]`，`seq` 由文件字节偏移派生）。`cmd/out/err` 按 `actionId` 归并；`think/say/end/report` 顺序平铺；工具 → 中文动作的规则在 `utils/terminal.ts`，未知工具降级为原始名 + JSON。SSE 与 HTTP 回填按 `seq` 合并去重，断线/切后台/服务重启后自动对账（`after`）。

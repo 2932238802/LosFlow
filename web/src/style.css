@@ -296,3 +296,9 @@ input[type=text], textarea, .sel, .num { border-radius: 9px; background: #101010
 .skel { display: grid; gap: 14px; margin-top: 20px; }
 .skel i { display: block; height: 52px; border-radius: 12px; background: linear-gradient(90deg, #101010, #171717, #101010); background-size: 200% 100%; animation: skel 1.2s ease-in-out infinite; }
 @keyframes skel { 0% { background-position: 200% 0 } 100% { background-position: -200% 0 } }
+
+/* 设置页 · 连接器 */
+.connector-card { margin-bottom: 14px; }
+.connector-card .sdot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #333; flex: 0 0 auto; }
+.connector-card .sdot.on { background: #5fd75f; box-shadow: 0 0 7px rgba(95, 215, 95, .8); }
+.connector-card .sdot.err { background: #ff7a7a; box-shadow: 0 0 7px rgba(255, 122, 122, .7); }

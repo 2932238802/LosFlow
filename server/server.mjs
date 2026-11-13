@@ -26,6 +26,7 @@ import * as docsync from "./docsync.mjs";
 import * as jobs from "./jobs.mjs";
 import * as skills from "./skills.mjs";
 import * as notify from "./notify.mjs";
+import * as connectors from "./connector-host.mjs";
 import { mutate } from "./store.mjs";
 import { renderMarkdown, wikiPage } from "./wiki.mjs";
 
@@ -36,6 +37,7 @@ pool.initPool(PATHS);
 approvals.initApprovals(PATHS);
 events.initEvents(PATHS);
 dispatch.initDispatch(PATHS);
+await connectors.initConnectors(PATHS);
 docsync.initDocsync(PATHS);
 jobs.initJobs(PATHS);
 skills.initSkills(PATHS);
@@ -290,20 +292,6 @@ function saveMaint(v) {
   writeFileSync(MAINT_FILE(), JSON.stringify(v, null, 2), "utf8");
 }
 
-function cleanupNote() {
-  const docUrl = "https://docs.qq.com/sheet/DZVFSeURwdmVJdVZL?tab=BB08J2";
-  return [
-    `文档 ${docUrl} 的主表（tab BB08J2）。`,
-    "任务：整理主表 —— 把【任务状态】为「已完成」或「已搁置」的数据行，从主表移除，按完成日期追加到「归档」tab。",
-    "硬约束：",
-    "1) 只动数据行，不动表头、序号公式、格式、筛选、隐藏列；",
-    "2) 目标 tab 是「归档」（没有就先建，并把表头复制过去）；",
-    "3) 逐行移动，移完读回核对：主表剩余行数、归档新增行数；",
-    "4) 用 report_task 回填：移了几行、主表剩几行、归档现有几行、读回校验结果。",
-    "做不到就回填 blocked，写清卡在哪一步 + 报错原文。",
-  ].join("\n");
-}
-
 function checkAutoCleanup() {
   try {
     const m = loadMaint();
@@ -317,10 +305,18 @@ function checkAutoCleanup() {
     }
     const threshold = Number(m.threshold);
     if (threshold > 0 && m.count >= threshold) {
-      // 整理主表是纯文档活：只入 docsync 队列交给 WorkBuddy，不建任务、不进终端
-      docsync.enqueueMaintenance({ note: cleanupNote() }).catch(() => undefined);
-      m.count = 0;
-      m.lastAt = new Date().toISOString();
+      // 整理主表是纯文档活：只入 docsync 队列交给连接器，不建任务、不进终端。
+      // 没有启用连接器时保留计数，等启用后下一次完成再触发。
+      docsync
+        .enqueueMaintenance({})
+        .then((jobs) => {
+          if (!jobs.length) return;
+          const cur = loadMaint();
+          cur.count = 0;
+          cur.lastAt = new Date().toISOString();
+          saveMaint(cur);
+        })
+        .catch(() => undefined);
     }
     saveMaint(m);
   } catch {
@@ -352,10 +348,10 @@ function markLegacyDocTasks() {
 
 function assertDispatchable(task) {
   if (task.docOnly) {
-    throw new Error("这条是腾讯文档同步任务，不派给 Claude Code；写文档走文档同步队列，WorkBuddy 会取走");
+    throw new Error("这条是文档同步任务，不派给 Claude Code；写文档走文档同步队列，由连接器执行");
   }
   if ((task.owner || "") === "workbuddy" && docsync.isDocSyncInstruction([task.subject, task.note].filter(Boolean).join("\n"))) {
-    throw new Error("这条是腾讯文档操作指令，不派给 Claude Code；请走文档同步队列（WorkBuddy 的 next_docsync）");
+    throw new Error("这条是文档操作指令，不派给 Claude Code；请走文档同步队列（executor 连接器会取走）");
   }
 }
 
@@ -719,6 +715,7 @@ async function buildState() {
     maintenance: loadMaint(),
     pool: pool.loadPool(),
     docsync: doc,
+    connectors: docsync.connectorsView(),
     terminals,
     history,
     approvals: approvals.loadApprovals().slice(-20).reverse(),
@@ -950,20 +947,13 @@ const ROUTES = {
     return { maintenance: m };
   },
   "/api/maintenance/cleanup": async (b) => {
-    const docUrl = b.docUrl || "https://docs.qq.com/sheet/DZVFSeURwdmVJdVZL?tab=BB08J2";
-    const note = [
-      `文档 ${docUrl} 的主表（tab BB08J2）。`,
-      "任务：整理主表 —— 把【任务状态】为「已完成」或「已搁置」的数据行，从主表移除，按完成日期追加到「归档」tab。",
-      "硬约束：",
-      "1) 只动数据行，不动表头、序号公式、格式、筛选、隐藏列；",
-      "2) 目标 tab 是「归档」（没有就先建，并把表头复制过去）；",
-      "3) 逐行移动，移完读回核对：主表剩余行数、归档新增行数；",
-      "4) 用 report_task 回填：移了几行、主表剩几行、归档现有几行、读回校验结果。",
-      "做不到就回填 blocked，写清卡在哪一步 + 报错原文。",
-    ].join("\n");
-    // 整理主表是纯文档活：入 docsync 队列等 WorkBuddy 取走，不建任务行
-    const job = await docsync.enqueueMaintenance({ note, docUrl });
-    return { docsync: job };
+    const jobs = await docsync.enqueueMaintenance({
+      note: String(b.note || ""),
+      docUrl: String(b.docUrl || ""),
+      connector: String(b.connector || ""),
+    });
+    if (!jobs.length) throw new Error("没有启用的文档连接器，未入队；请到设置页启用或配置连接器");
+    return { docsync: jobs, skipped: false };
   },
   // 推入 = 两条线：任务本体落库后立刻派单；文档那一行进异步队列（docsync）。
   // 工作 Agent（Claude Code）的任务自动开工，WorkBuddy 的任务等 WB 取走。
@@ -991,6 +981,19 @@ const ROUTES = {
     return { item: out.item, created: out.created, docsync: out.docsync, autoStarted };
   },
   "/api/docsync/report": (b) => docsync.report({ id: b.id, status: b.status, evidence: b.evidence }),
+  // 连接器：配置 / 测试行 / 重放失败（13 号方案）
+  "/api/connectors": async (b) => {
+    const c = await connectors.saveConnector(b);
+    return { connector: c, connectors: docsync.connectorsView() };
+  },
+  "/api/connectors/test": async (b) => {
+    const job = await docsync.probe(b.id);
+    return { job, docsync: docsync.summary() };
+  },
+  "/api/connectors/replay": async (b) => {
+    const r = await docsync.replayFailed(String(b.id || ""));
+    return { ...r, docsync: docsync.summary() };
+  },
   // 清历史：删 N 小时前的 runs/*.json 与 WSL /tmp 里的 cc-*（台账和任务表不动）
   "/api/maintenance/purge": async (b) => {
     const hours = Math.max(1, Number(b.hours || 24));
@@ -1129,7 +1132,7 @@ const ROUTES = {
     if (status === "done") {
       const workType = pool.normWorkType(task.workType);
       const raw = b.area && typeof b.area === "object" ? b.area : {};
-      const kind = raw.kind === "docs" ? "docs" : workType === "dev" ? "code" : "docs";
+      const kind = raw.kind === "docs" || raw.kind === "code" ? raw.kind : workType === "dev" ? "code" : "docs";
       // 代码区默认任务卡上的 repo；文档区必须由人指定路径
       const path = String(raw.path || "").trim() || (kind === "code" ? String(task.repo || "") : "");
       if (kind === "docs" && !path) throw new Error("文档区要指定路径");
@@ -1142,7 +1145,7 @@ const ROUTES = {
         finishedAt: Date.now(),
       });
       // 回填腾讯文档：一条 update-row（类型 + 区域），WorkBuddy 取到后改状态与备注
-      await docsync.enqueueBackfill({ taskId: b.id, subject: t.subject, workType, area: t.area });
+      await docsync.enqueueBackfill({ taskId: b.id, subject: t.subject, workType, area: t.area, project: t.repo || "" });
       checkAutoCleanup();
       return { task: t };
     }
@@ -1281,6 +1284,9 @@ const server = createServer(async (req, res) => {
 
   if (req.method === "GET" && url.pathname === "/api/docsync") {
     return sendJson(res, 200, docsync.summary());
+  }
+  if (req.method === "GET" && url.pathname === "/api/connectors") {
+    return sendJson(res, 200, { connectors: docsync.connectorsView() });
   }
 
   if (req.method === "GET" && url.pathname === "/api/task/raw") {

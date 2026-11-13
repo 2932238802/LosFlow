@@ -6,10 +6,13 @@
 
 | 路径 | 说明 |
 | --- | --- |
-| `/api/state` | 全部状态：`now / tasks / pool / docsync / approvals / allowlist / notify / terminals / history / projects / running / calls / spendToday / defaultEnv`；`tasks[]` 带 `docOnly`（文档同步类任务，不进任务页/终端页）、`starting`（已投递、子进程未接管）、`running`（这张卡自己的活会话 runId）、`env`（解析后的 `wsl`/`windows`）、`envMode`（`auto`/`wsl`/`windows`）、`sessionEnv`、`lastError`（最近一次 preflight / 失败原因）；`tasks[].run` 只带 `id/at/status/env/cost/turns`（`cost` 缺失时为 `null`），回执全文走 `/api/task/run`；`projects[]` 带 `env`（模式）与 `resolvedEnv`；`terminals.items[]` 带 `env`；`approvals[]` 带 `live`（执行前实时请求）/ `midRun`（已发生的拒绝）/ `runId` / `taskId` / `tool` / `expiresAt` / `waitedMs`；`notify` 是 Windows 提醒状态 `{enabled,ok,mode,lastAt,lastError}` |
+| `/api/state` | 全部状态：`now / tasks / pool / docsync / approvals / allowlist / notify / terminals / history / projects / running / calls / spendToday / defaultEnv`；`tasks[]` 带 `docOnly`（文档同步类任务，不进任务页/终端页）、`starting`（已投递、子进程未接管）、`running`（这张卡自己的活会话 runId）、`env`（解析后的 `wsl`/`windows`）、`envMode`（`auto`/`wsl`/`windows`）、`sessionEnv`、`lastError`（最近一次 preflight / 失败原因）；`tasks[].run` 只带 `id/at/status/env/cost/turns`（`cost` 缺失时为 `null`），回执全文走 `/api/task/run`；`projects[]` 带 `env`（模式）与 `resolvedEnv`；`terminals.items[]` 带 `env`；`approvals[]` 带 `live`（执行前实时请求）/ `midRun`（已发生的拒绝）/ `runId` / `taskId` / `tool` / `expiresAt` / `waitedMs`；`notify` 是 Windows 提醒状态 `{enabled,ok,mode,lastAt,lastError}`；`connectors[]` 是连接器列表 + `enabled/target/mapping/actions/queue/health/queueStats`（不返回密钥） |
 | `/api/job?id=<jobId>` | 单个后台作业：`{id,kind,key,label,status,at,startedAt,doneAt,elapsedMs,result?,error?,cost?,via?}`；`status` = `running` / `ok` / `failed`。用于拆分等长动作的轮询，结果全文在 `result` |
 | `/api/jobs?kind=<kind>` | 作业列表（默认最近 200 条，按 `at` 倒序）。池子行徽标用；`kind=pool.suggest` 即拆分作业 |
-| `/api/docsync` | 文档同步队列摘要 |
+| `/api/docsync` | 文档同步队列摘要：`{pending,running,done,failed,byConnector,byTask,recent}`；每个 job 带 `connector/connectorKind/action/targetSnapshot/queue` |
+| `/api/connectors` | `GET`：`{connectors:[...]}`；`POST {id,enabled?,target?,mapping?,actions?,match?,queue?,secret?,clearSecret?}`：保存连接器配置（写 `data/connectors.json`；密钥写 `data/secrets.json`，永不回显） |
+| `/api/connectors/test` | `{id}`：入队一条 `probe`（executor 交给外部 agent，direct 立刻执行） |
+| `/api/connectors/replay` | `{id?}`：把 failed 的同步改回 pending（按连接器过滤；不传=全部） |
 | `/api/task/raw?id=<taskId>` | 某任务的终端行（`think/cmd/out/err/say/end/report`）+ 对应 runId（SSE 覆盖不到时的一次性回放） |
 | `/api/task/raw?id=<taskId>&v=2` | **平铺日志契约**：`{dispatch,source,running,truncated,hasMore,hasEarlier,firstSeq,lastSeq,totalRounds,stats,rounds[],end,lines[]}`。`source` 依次尝试 `archive`（`data/streams/<id>.jsonl`）→ `wsl` / `windows`（runstate 里记录的在跑流）→ `wsl`（旧 `/tmp/cc-<id>.stream.jsonl`）→ `missing`；`lines[]` 每条带 `seq`（文件字节偏移派生，HTTP 与 SSE 同一套编号）/`kind`/`tool`/`input`/`ok`/`actionId`；`&after=<seq>` 只返回更晚的行（断线对账），`&beforeSeq=<seq>` 往更早翻；默认保留最新窗口，`hasEarlier` 表示还能往前翻；单响应 ≤ 2 MB；`rounds[]` 保留给验收/摘要兼容；`end.cost` 缺失时为 `null`（前端显示「—」） |
 | `/api/task/stream?id=<taskId>` | 下载这条会话的原始 stream-json（`data/streams`、runstate 或 WSL `/tmp`），不做解析；找不到返回 404 |
@@ -35,7 +38,7 @@
 | `/api/pool/worktype` | `{id,workType}` | 改池子条目的工作类型（父/子都可改；子条目默认继承父条目） |
 | `/api/pool/suggest` | `{id,prompt?,sync?}` | **投递型**：立刻返回 `{jobId,reused}`，后台拆分；同一池子条目在跑时再点返回同一 jobId（`reused:true`，不重复花费）。输出契约与硬规则来自 `docs/skills/split.md`（默认字段 `title/owner/reason/note`）。进度/结果走 `GET /api/job?id=<jobId>`，关弹层 / 刷新不丢。`sync:1` 保留旧行为（等结果，仅排查用） |
 | `/api/pool/apply` | `{id,subs:[{title,owner?,reason?,note,workType?}]}` | 落拆分结果：子条目 `note` 必填（缺省时沿用父正文；仍为空 → 400 含标题）；`workType` 缺省继承父条目；记录父 `children`、`stage=split` |
-| `/api/pool/push` | `{id,priority}` | 推入：父条目拆过时推**子任务**（不发父标题），每条任务 `note` 只放正文；正文为空 → 400；文档同步备注用该条自己的正文；**Claude Code 任务落库后自动派单**（WorkBuddy 任务等 WB 取走） |
+| `/api/pool/push` | `{id,priority}` | 推入：父条目拆过时推**子任务**（不发父标题），每条任务 `note` 只放正文；正文为空 → 400；文档同步按启用且支持 `append-row` 的连接器 **fan-out**（每个连接器一条 job，各自重试）；**Claude Code 任务落库后自动派单**（WorkBuddy 任务等 WB 取走） |
 | `/api/pool/note` | `{id,note}` | 编辑「任务本身」（正文）；存量空壳（如 p9）靠它补回 |
 | `/api/pool/optimize` | `{id}` | 拆分前补全需求（不拆）：直连网关 → 结果写回父条目正文，返回 `{note,via}` |
 | `/api/pool/remove` | `{id}` | 删池子条目 |
@@ -53,7 +56,7 @@
 | `/api/approve` | `{id,remember?}` | `live` 请求：写 `data/live/<id>.res.json`，**同一次 run 继续执行，不重派**；`remember:true` 同时写 allowlist。`midRun` / legacy 请求：写 allowlist + 按原 `env`/`repo` 重派一次。返回带 `live:true` 或 `retry` |
 | `/api/reject` | `{id}` | `live` 请求：写 deny（带「不要换个写法重试」），同一次 run 继续；legacy 只改状态 |
 | `/api/maintenance/purge` | `{hours}` | 清 N 小时前的 runs、WSL `/tmp/cc-*` 与过期的 `data/runstate`；`data/jobs` 与 `data/live`（含 archive）按 7 天清理 |
-| `/api/maintenance/config` / `/api/maintenance/cleanup` | — | 自动整理阈值 / 整理主表**入 docsync 队列**（`action:"cleanup"`，不建任务） |
+| `/api/maintenance/config` / `/api/maintenance/cleanup` | `{note?,docUrl?,connector?}` | 自动整理阈值 / 整理主表按连接器 fan-out 入 docsync 队列（`action:"cleanup"`，不建任务）；没有启用连接器 → 400 |
 | `/api/projects/add` / `/api/projects/remove` | `{name,path,env?}` / `{id}` | 项目列表；`env` = `auto`（默认，按路径判定）/ `wsl` / `windows` |
 | `/api/config` | `{defaultEnv?,windowsClaudeCmd?,claudeTimeoutSec?}` | 写 `losflow.config.json`（只这几个字段，网关 key 不经过接口），运行中立即生效 |
 

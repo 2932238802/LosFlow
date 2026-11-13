@@ -117,6 +117,35 @@ export type WbCall = { at?: string; tool?: string; ok?: boolean; args?: unknown 
 
 export type NotifyStatus = { enabled: boolean; ok?: boolean; mode?: string; lastAt?: string; lastError?: string };
 
+export type ConnectorHealth = {
+  lastOkAt?: number;
+  lastErrorAt?: number;
+  lastError?: string;
+  lastAction?: string;
+  lastJobId?: string;
+};
+
+export type ConnectorQueueStats = { pending: number; running: number; done: number; failed: number; lastAt: number };
+
+export type ConnectorView = {
+  id: string;
+  kind: "executor" | "direct" | string;
+  version?: string;
+  label: string;
+  capabilities?: string[];
+  secrets?: string[];
+  enabled: boolean;
+  target?: Record<string, any>;
+  mapping?: Record<string, any>;
+  actions?: string[];
+  match?: Record<string, any>;
+  queue?: Record<string, any>;
+  hasSecret?: boolean;
+  health?: ConnectorHealth;
+  queueStats?: ConnectorQueueStats;
+  configSchema?: Record<string, any> | null;
+};
+
 export type State = {
   now?: string;
   projects: Project[];
@@ -129,6 +158,7 @@ export type State = {
   approvals: Approval[];
   allowlist?: string[];
   notify?: NotifyStatus;
+  connectors?: ConnectorView[];
   tasks: Task[];
   calls?: WbCall[];
   spendToday: number;

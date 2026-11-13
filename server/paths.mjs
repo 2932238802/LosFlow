@@ -48,6 +48,11 @@ const DEFAULTS = {
   approvalTimeoutSec: 50,
   // Windows 桌面提醒：新请求入队即弹 NotifyIcon 气球 + 声音；20s 未处理再响一次
   notify: { enabled: true, mode: "auto", sound: true, minIntervalMs: 8000, repeatAfterMs: 20000 },
+  // 连接器：配置 / 密钥 / 本地台账 / 插件目录（13 号方案）
+  connectorsDir: join(ROOT, "server", "connectors"),
+  connectorsFile: join(ROOT, "data", "connectors.json"),
+  secretsFile: join(ROOT, "data", "secrets.json"),
+  ledgerDir: join(ROOT, "data", "ledger"),
   dashboardPort: 8899,
   nodeExe: process.env.LOSFLOW_NODE || "node",
 };
@@ -101,5 +106,10 @@ export function loadPaths() {
   // 兼容旧字段名（原来叫 progressDir / toolsDir，现在统一指向 data）
   out.progressDir = out.dataDir;
   out.toolsDir = out.dataDir;
+  // 连接器配置跟着 dataDir 走（测试换数据目录时不会写真实 data/）
+  out.connectorsDir = env("LOSFLOW_CONNECTORS_DIR", cfg.connectorsDir || join(ROOT, "server", "connectors"));
+  out.connectorsFile = env("LOSFLOW_CONNECTORS_FILE", cfg.connectorsFile || join(out.dataDir, "connectors.json"));
+  out.secretsFile = env("LOSFLOW_SECRETS", cfg.secretsFile || join(out.dataDir, "secrets.json"));
+  out.ledgerDir = env("LOSFLOW_LEDGER", cfg.ledgerDir || join(out.dataDir, "ledger"));
   return out;
 }
