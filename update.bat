@@ -24,13 +24,20 @@ rem   If either check fails it exits with an error instead of pretending
 rem   the update worked.
 rem
 rem Usage:
-rem   update.bat               build + restart (default)
+rem   update.bat               build + checks + restart (default)
 rem   update.bat --no-build    restart only, no build
+rem   update.bat --no-check    skip typecheck / unit tests / smoke
+rem   update.bat --check-only  build + checks only, do not restart
 rem   update.bat --port 8900   use another port (default LOSFLOW_PORT /
 rem                            losflow.config.json / 8899)
 rem   update.bat --force       also kill a non-server.mjs process holding
-rem                            the port (refused by default)
+rem                            the port and restart even if tasks are running
+rem                            (refused by default)
 rem   update.bat -h            help
+rem
+rem Checks run against an isolated data dir, so they never race the live
+rem dashboard. A restart is refused while a task is still running unless
+rem --force is given.
 rem
 rem Note: builds the current working tree; does not git pull.
 rem =====================================================================
@@ -53,10 +60,12 @@ function Show-Help {
   Out-Line 'update.bat -- 重建前端 + 用本仓库的服务接管驾驶舱端口，并验证接管成功。'
   Out-Line ''
   Out-Line '用法：'
-  Out-Line '  update.bat               构建 + 重启（默认）'
+  Out-Line '  update.bat               构建 + 检查 + 重启（默认）'
   Out-Line '  update.bat --no-build    只重启，不构建'
+  Out-Line '  update.bat --no-check    跳过类型检查 / 单测 / 冒烟'
+  Out-Line '  update.bat --check-only  只构建 + 检查，不重启服务'
   Out-Line '  update.bat --port 8900   指定端口（默认 LOSFLOW_PORT / losflow.config.json / 8899）'
-  Out-Line '  update.bat --force       端口被非 server.mjs 进程占用时也强杀（默认拒绝）'
+  Out-Line '  update.bat --force       端口被非 server.mjs 进程占用时也强杀；有任务在跑时也重启'
   Out-Line '  update.bat -h            帮助'
 }
 
@@ -66,12 +75,16 @@ if ($env:LOSFLOW_ARGS) {
   $argv = @($env:LOSFLOW_ARGS -split '\s+' | Where-Object { $_ } | ForEach-Object { $_.Trim('"').Trim("'") })
 }
 $doBuild = $true
+$doCheck = $true
+$checkOnly = $false
 $force = $false
 $portArg = $null
 for ($i = 0; $i -lt $argv.Count; $i++) {
   switch ($argv[$i]) {
-    '--no-build' { $doBuild = $false }
-    '--force'    { $force = $true }
+    '--no-build'   { $doBuild = $false }
+    '--no-check'   { $doCheck = $false }
+    '--check-only' { $checkOnly = $true }
+    '--force'      { $force = $true }
     '--port'     {
       $i++
       if ($i -ge $argv.Count) { Die '--port 后面要跟端口号' }
@@ -89,6 +102,12 @@ if (-not $root) { Die '拿不到脚本所在目录' }
 Set-Location -LiteralPath $root
 
 if (-not (Get-Command node -ErrorAction SilentlyContinue)) { Die '找不到 node（需要 Node >= 20）' }
+$nodeVer = (& node -p "process.versions.node").Trim()
+$nodeMajor = [int](($nodeVer -split '\.')[0])
+if ($nodeMajor -lt 20) { Die "Node $nodeVer 太旧（需要 >= 20）" }
+
+$tmp = Join-Path $root '.tmp'
+New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 
 # ---------- 端口：参数 > LOSFLOW_PORT > losflow.config.json > 8899 ----------
 $port = $null
@@ -121,6 +140,92 @@ if (-not (Test-Path -LiteralPath $distIndex)) { Die 'web\dist\index.html 不存�
 $expect = [regex]::Match((Get-Content -LiteralPath $distIndex -Raw), 'assets/index-[A-Za-z0-9_-]+\.js').Value
 if (-not $expect) { Die 'web/dist/index.html 里找不到前端产物，构建可能不完整' }
 
+# ---------- 1.5 重启保护：有任务在跑就不动服务（--force 可跳过） ----------
+function Get-LiveState {
+  try { Invoke-RestMethod -UseBasicParsing -Uri "http://127.0.0.1:$port/api/state" -TimeoutSec 3 -ErrorAction Stop }
+  catch { $null }
+}
+function Assert-NoLiveRuns {
+  if ($force) { return }
+  $st = Get-LiveState
+  $busy = @()
+  if ($st) {
+    $busy = @($st.tasks | Where-Object { $_.running -or $_.starting } | ForEach-Object { '#' + $_.id })
+    if (-not $busy.Count -and $st.running -and $st.running.taskId) { $busy = @('#' + $st.running.taskId) }
+  }
+  try {
+    $jobs = Invoke-RestMethod -UseBasicParsing -Uri "http://127.0.0.1:$port/api/jobs?kind=pool.suggest" -TimeoutSec 3 -ErrorAction Stop
+    $busy += @($jobs.jobs | Where-Object { $_.status -eq 'running' } | ForEach-Object { '拆分 ' + $_.label })
+  }
+  catch { }
+  $busy = @($busy | Where-Object { $_ } | Select-Object -Unique)
+  if ($busy.Count -gt 0) {
+    Die "端口 $port 上还有活在跑（$($busy -join ' ')）。等它跑完再更新；确认现在重启就加 --force。"
+  }
+}
+if (-not $checkOnly) { Assert-NoLiveRuns }
+
+# ---------- 1.6 检查：类型 / 单测 / 冒烟（隔离数据目录，不碰正在跑的服务） ----------
+function Get-FreePort {
+  $ip = [System.Net.IPAddress]::Loopback
+  $l = New-Object System.Net.Sockets.TcpListener -ArgumentList $ip, 0
+  $l.Start()
+  $p = $l.LocalEndpoint.Port
+  $l.Stop()
+  $p
+}
+function Invoke-SmokeCheck {
+  $dir = Join-Path $tmp ("smoke-" + $port)
+  Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+  New-Item -ItemType Directory -Force -Path $dir | Out-Null
+  $oldData = $env:LOSFLOW_DATA
+  $oldTemp = $env:LOSFLOW_TEMP
+  $oldStreams = $env:LOSFLOW_STREAMS
+  $oldRunstate = $env:LOSFLOW_RUNSTATE
+  $oldSmoke = $env:SMOKE_PORT
+  $env:LOSFLOW_DATA = $dir
+  $env:LOSFLOW_TEMP = Join-Path $dir 'tmp'
+  $env:LOSFLOW_STREAMS = Join-Path $dir 'streams'
+  $env:LOSFLOW_RUNSTATE = Join-Path $dir 'runstate'
+  $env:SMOKE_PORT = [string](Get-FreePort)
+  $rc = 0
+  try {
+    Info "冒烟检查（隔离数据目录 + 临时端口 $($env:SMOKE_PORT)）"
+    & npm run smoke
+    $rc = $LASTEXITCODE
+  }
+  finally {
+    if ($null -eq $oldData) { Remove-Item Env:LOSFLOW_DATA -ErrorAction SilentlyContinue } else { $env:LOSFLOW_DATA = $oldData }
+    if ($null -eq $oldTemp) { Remove-Item Env:LOSFLOW_TEMP -ErrorAction SilentlyContinue } else { $env:LOSFLOW_TEMP = $oldTemp }
+    if ($null -eq $oldStreams) { Remove-Item Env:LOSFLOW_STREAMS -ErrorAction SilentlyContinue } else { $env:LOSFLOW_STREAMS = $oldStreams }
+    if ($null -eq $oldRunstate) { Remove-Item Env:LOSFLOW_RUNSTATE -ErrorAction SilentlyContinue } else { $env:LOSFLOW_RUNSTATE = $oldRunstate }
+    if ($null -eq $oldSmoke) { Remove-Item Env:SMOKE_PORT -ErrorAction SilentlyContinue } else { $env:SMOKE_PORT = $oldSmoke }
+    Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+  }
+  if ($rc -ne 0) { Die '冒烟检查失败，当前服务未动' }
+}
+
+if ($doCheck) {
+  if (-not (Get-Command npm -ErrorAction SilentlyContinue)) { Die '找不到 npm' }
+  Info '类型检查（npm run typecheck）'
+  & npm run typecheck
+  if ($LASTEXITCODE -ne 0) { Die '类型检查失败，当前服务未动' }
+  if ($nodeMajor -ge 24) {
+    Info '单元测试（npm test）'
+    & npm test
+    if ($LASTEXITCODE -ne 0) { Die '单元测试失败，当前服务未动' }
+  }
+  else {
+    Info "跳过 npm test（Node $nodeVer；TS 测试需要 Node 24）"
+  }
+  Invoke-SmokeCheck
+}
+
+if ($checkOnly) {
+  Out-Line '✓ 构建 / 检查通过（--check-only：没有重启服务）'
+  exit 0
+}
+
 function Get-ListenPids([int]$port) {
   $res = netstat -ano | ForEach-Object {
     $f = $_.Trim() -split '\s+'
@@ -133,8 +238,6 @@ function Get-CmdLine($procId) {
   if ($p) { $p.CommandLine } else { '' }
 }
 
-$tmp = Join-Path $root '.tmp'
-New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 $srvJs = Join-Path $root 'server\server.mjs'
 # 日志 / pid 按端口区分：同一个 .tmp 里可能同时跑多个驾驶舱（--port 8900 之类），
 # 共用一份日志会互相锁文件，后来启动的那个 cmd 会直接退出（退出码 1）。
@@ -143,6 +246,8 @@ $errLog = Join-Path $tmp "dashboard-$port.err.log"
 $pidFile = Join-Path $tmp "dashboard-$port.pid"
 
 # ---------- 2. 找到端口占用者：是驾驶舱就停掉，不是就拒绝 ----------
+# 检查期间可能又有新任务开跑：落刀前再确认一次。
+Assert-NoLiveRuns
 $pids = @(Get-ListenPids $port)
 foreach ($p in $pids) {
   $cmd = Get-CmdLine $p

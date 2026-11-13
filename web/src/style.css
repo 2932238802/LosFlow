@@ -49,6 +49,7 @@ body {
 .side-foot { margin-top: 14px; font-family: var(--mono); font-size: 12px; color: var(--dim); letter-spacing: .04em; }
 .cost { font-size: 19px; color: var(--mid); margin-top: 12px; font-family: var(--mono); font-weight: 400; }
 .live-line { color: var(--fg); display: flex; align-items: center; gap: 8px; }
+.live-line.warn { color: #ffb454; cursor: pointer; }
 .main { padding: 56px 72px 160px; min-width: 0; width: 100%; }
 @media (max-width: 900px) {
   .shell { grid-template-columns: 1fr; }
@@ -65,6 +66,24 @@ body {
 /* ---------- 通用 ---------- */
 .msg { font-size: 14.5px; font-weight: 500; color: var(--fg); min-height: 26px; margin-bottom: 18px; }
 .msg.err { text-decoration: underline; }
+
+/* ---------- 长动作进度 ---------- */
+.runprog { margin: -6px 0 22px; }
+.runprog-head {
+  display: flex; align-items: baseline; gap: 10px;
+  font-size: 14.5px; color: var(--mid); font-weight: 500;
+}
+.runprog-sec { margin-left: auto; font-family: var(--mono); font-size: 12.5px; color: var(--dim); }
+.runprog-track { position: relative; height: 2px; margin-top: 8px; background: var(--line); overflow: hidden; }
+.runprog-fill {
+  position: absolute; top: 0; bottom: 0; width: 34%;
+  background: var(--fg); animation: runprog 1.25s ease-in-out infinite;
+}
+@keyframes runprog { 0% { left: -34% } 100% { left: 100% } }
+.runprog-hint { margin-top: 6px; font-size: 12.5px; color: var(--dim); font-weight: 300; }
+@media (prefers-reduced-motion: reduce) {
+  .runprog-fill { animation: none; left: 0; width: 100%; opacity: .45; }
+}
 .hd {
   display: flex; align-items: baseline; gap: 12px; margin: 0 0 22px;
   font-family: var(--serif); font-size: 14px; letter-spacing: .18em; text-transform: uppercase;
@@ -130,6 +149,7 @@ section:first-of-type { margin-top: 0; }
 .detail { margin-top: 26px; border-top: 1px solid var(--line-soft); padding-top: 26px; }
 .promptbox { margin: 18px 0 8px; border: 1px solid var(--line); padding: 20px 22px; border-radius: 3px; }
 .hint { font-size: 13px; color: var(--dim); margin: 0 0 10px; letter-spacing: .04em; }
+.hint.bad { color: #d98a8a; }
 .pushbox { display: flex; gap: 16px; align-items: center; margin-top: 18px; border-top: 1px solid var(--line-soft); padding-top: 18px; }
 
 /* ---------- 表单 ---------- */
@@ -228,6 +248,7 @@ input[type=text], textarea, .sel, .num { border-radius: 9px; background: #101010
 .acts .act { border-bottom: 0; padding: 6px 12px; border-radius: 8px; background: #131313; font-size: 13.5px; }
 .acts .act:hover { background: #1d1d1d; color: var(--fg); border-bottom: 0; }
 .acts .act:disabled { background: #0c0c0c; color: #3a3a3a; }
+.acts .act.on { background: var(--fg); color: #0b0b0b; border-bottom: 0; }
 .acts .act.danger { background: transparent; }
 .acts .act.danger:hover { background: #1a1414; }
 .term { border-radius: 12px; border-color: var(--line-soft); }
@@ -256,12 +277,20 @@ input[type=text], textarea, .sel, .num { border-radius: 9px; background: #101010
 
 /* 最终回执全文 */
 .l-report { color: var(--mid); white-space: pre-wrap; border-top: 1px dashed var(--line-soft); margin-top: 10px; padding-top: 10px; }
-
-/* 三项确认（池子条目） */
-.confirms { display: flex; gap: 18px; flex-wrap: wrap; align-items: center; margin-top: 12px; font-size: 13.5px; color: var(--muted); }
-.confirm { display: inline-flex; align-items: center; gap: 7px; cursor: pointer; user-select: none; }
-.confirm input { accent-color: #8a8a8a; width: 14px; height: 14px; cursor: pointer; }
 .pmeta.live { color: #b9b9b9; }
+
+/* 拆分弹层：每条子任务的正文编辑 */
+.splited { margin-top: 20px; }
+.splitrow { border-top: 1px dashed var(--line-soft); padding: 14px 0; display: grid; gap: 8px; }
+.splitrow-hd { display: flex; gap: 10px; align-items: center; }
+.splitrow-hd input[type=text] { flex: 1; }
+.splitrow-hd input[type=checkbox] { accent-color: #8a8a8a; width: 14px; height: 14px; }
+.splitrow-reason { color: var(--dim); font-size: 12.5px; font-weight: 300; }
+.splitrow textarea { width: 100%; resize: vertical; }
+.splitrow-acts { display: flex; gap: 12px; align-items: center; }
+/* 池子卡片：正文编辑 */
+.note-edit { margin-top: 12px; display: grid; gap: 8px; }
+.note-edit textarea { width: 100%; resize: vertical; }
 
 /* 首屏骨架：state 还没回来时别闪「没有任务 / 池子空了」 */
 .skel { display: grid; gap: 14px; margin-top: 20px; }

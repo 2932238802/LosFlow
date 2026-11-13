@@ -1,11 +1,11 @@
-import { computed, nextTick, reactive, ref, watch } from "vue";
+import { computed, nextTick, ref, watch } from "vue";
 import { post } from "../api";
-import type { RawLine, Task, TermHistory, TermRound } from "../types";
+import type { RawLine, Task, TermHistory } from "../types";
 import { nowMs, refresh, s } from "./useAppState";
 import { askConfirm } from "./useConfirm";
 import { flash } from "./useToast";
 import { view } from "./useView";
-import { anomalies, isChangedTool, roundMatches, roundStats } from "../utils/terminal";
+import { buildLogRows, isChangedTool, logAnomalies, logStats, logText, rowMatches, type LogRow } from "../utils/terminal";
 
 // ---- 会话列表 / 选中 ----
 export const termTasks = computed(() => {
@@ -34,9 +34,52 @@ export function selectTask(id: string) {
 export function goTerm(id: string) {
   view.value = "terminals";
   selectTask(id);
+  expandSession(String(id));
 }
 
-// 列表里没有选中项时自动选第一条（优先正在跑的）
+// ---- 单个会话的展开 / 收起（点击会话行切换，状态跟随该会话并持久化） ----
+const COLLAPSE_KEY = "losflow.term.collapsedSessions";
+function readCollapsed(): Record<string, boolean> {
+  try {
+    const raw = JSON.parse(localStorage.getItem(COLLAPSE_KEY) || "{}");
+    return raw && typeof raw === "object" ? raw : {};
+  } catch {
+    return {};
+  }
+}
+export const collapsedSessions = ref<Record<string, boolean>>(readCollapsed());
+
+function persistCollapsed() {
+  try {
+    localStorage.setItem(COLLAPSE_KEY, JSON.stringify(collapsedSessions.value));
+  } catch {
+    /* 隐私模式 */
+  }
+}
+
+export function isSessionCollapsed(id: string): boolean {
+  return !!collapsedSessions.value[String(id)];
+}
+
+export function expandSession(id: string) {
+  const key = String(id);
+  if (!collapsedSessions.value[key]) return;
+  const next = { ...collapsedSessions.value };
+  delete next[key];
+  collapsedSessions.value = next;
+  persistCollapsed();
+}
+
+export function toggleSession(id: string) {
+  const key = String(id);
+  const next = { ...collapsedSessions.value };
+  if (next[key]) delete next[key];
+  else next[key] = true;
+  collapsedSessions.value = next;
+  persistCollapsed();
+  if (next[key] && fullTerm.value === key) closeFull();
+}
+
 watch(
   termTasks,
   (list) => {
@@ -52,7 +95,6 @@ export const runningId = computed(() => (s.value?.running && s.value.running.tas
 export function taskOf(id: string) {
   return (s.value?.tasks || []).find((t) => t.id === String(id)) || null;
 }
-// 这张卡自己的会话（并发派单时不会串台）；running.json 是「刚启动、台账还没写」的兜底
 export function isRunning(id: string) {
   const t = taskOf(id);
   return !!t?.running || runningId.value === String(id);
@@ -68,11 +110,16 @@ export const runningElapsed = computed(() => {
   return Math.max(0, Math.round((nowMs.value - t0) / 1000));
 });
 
-// ---- 轮 / 动作（6 号契约）----
-export const rounds = ref<Record<string, TermRound[]>>({});
+// ---- 平铺日志（12 号方案）----
+// 任何路径都只做「按 seq 合并、只追加」，不整体替换：SSE、HTTP 回填、
+// 断线对账共用同一个 merge，避免把已经推来的实时行擦掉。
+export const lines = ref<Record<string, RawLine[]>>({});
 export const hist = ref<Record<string, TermHistory>>({});
 export const lastEventAt = ref<Record<string, number>>({});
 const loading = new Set<string>();
+const fetchTimers: Record<string, number> = {};
+// 换 run 时 epoch +1：之前发出去的整窗回填晚到，也不能把旧会话的行合并进来。
+const epochs: Record<string, number> = {};
 
 function emptyHist(): TermHistory {
   return {
@@ -87,27 +134,52 @@ function emptyHist(): TermHistory {
   };
 }
 
-export async function loadRounds(id: string, before = 0) {
-  const key = `${id}:${before}`;
+function lineKey(l: RawLine): string {
+  if (l.seq !== undefined && l.seq !== null) return `s${l.seq}`;
+  return `${l.at || ""}|${l.kind}|${l.text || ""}`;
+}
+
+export function mergeLines(existing: RawLine[], incoming: RawLine[], cap = 3000): RawLine[] {
+  const map = new Map<string, RawLine>();
+  for (const l of existing || []) if (l) map.set(lineKey(l), l);
+  for (const l of incoming || []) if (l) map.set(lineKey(l), l);
+  const out = [...map.values()].sort((a, b) => Number(a.seq || 0) - Number(b.seq || 0));
+  return out.length > cap ? out.slice(out.length - cap) : out;
+}
+
+export function lastSeq(id: string): number {
+  const list = lines.value[id] || [];
+  return list.length ? Number(list[list.length - 1].seq || 0) : 0;
+}
+
+export async function loadHistory(id: string, { after = 0, beforeSeq = 0 } = {}) {
+  const epoch = epochs[id] || 0;
+  const key = `${id}:${epoch}:${after}:${beforeSeq}`;
   if (loading.has(key)) return;
   loading.add(key);
   try {
-    const r = await fetch(`/api/task/raw?id=${encodeURIComponent(id)}&v=2${before ? `&before=${before}` : ""}`, { cache: "no-store" });
-    const j = (await r.json()) as TermHistory & { error?: string };
+    const qs = new URLSearchParams({ id, v: "2" });
+    if (after) qs.set("after", String(after));
+    if (beforeSeq) qs.set("beforeSeq", String(beforeSeq));
+    const r = await fetch(`/api/task/raw?${qs.toString()}`, { cache: "no-store" });
+    const j = (await r.json()) as TermHistory & { error?: string; hasEarlier?: boolean };
     if (!j || j.error) return;
-    const incoming = Array.isArray(j.rounds) ? j.rounds : [];
-    if (before > 0) {
-      const cur = rounds.value[id] || [];
-      const seen = new Set(cur.map((x) => x.msgId));
-      const older = incoming.filter((x) => !seen.has(x.msgId));
-      rounds.value = { ...rounds.value, [id]: [...older, ...cur] };
-      hist.value = { ...hist.value, [id]: { ...(hist.value[id] || emptyHist()), hasMore: !!j.hasMore } };
+    // 请求期间这条会话换了 run（SSE reset）：丢弃旧回填
+    if ((epochs[id] || 0) !== epoch) return;
+    const incoming = Array.isArray(j.lines) ? j.lines : [];
+    if (beforeSeq > 0) {
+      lines.value = { ...lines.value, [id]: mergeLines(incoming, lines.value[id] || []) };
+      hist.value = { ...hist.value, [id]: { ...(hist.value[id] || emptyHist()), hasMore: !!j.hasEarlier } };
     } else {
-      // 归档/流都不在时服务端返回空窗口；别把 SSE 已经推来的实时轮次擦掉
-      if (!(j.source === "missing" && !incoming.length && (rounds.value[id] || []).length)) {
-        rounds.value = { ...rounds.value, [id]: incoming };
+      const cur = lines.value[id] || [];
+      // 归档/流都不在时服务端返回空窗口；别把 SSE 已经推来的实时行擦掉
+      if (!(j.source === "missing" && !incoming.length && cur.length)) {
+        lines.value = { ...lines.value, [id]: mergeLines(cur, incoming) };
       }
-      hist.value = { ...hist.value, [id]: j };
+      hist.value = {
+        ...hist.value,
+        [id]: { ...(hist.value[id] || emptyHist()), ...j, hasMore: !!j.hasEarlier },
+      };
       if (j.stats && j.stats.lastEventAt) {
         lastEventAt.value = { ...lastEventAt.value, [id]: j.stats.lastEventAt };
       }
@@ -120,88 +192,90 @@ export async function loadRounds(id: string, before = 0) {
 }
 
 export function ensureHistory(id: string) {
-  if (!hist.value[id]) loadRounds(id);
+  if (!hist.value[id] || !(lines.value[id] || []).length) loadHistory(id);
 }
 
-const fetchTimers: Record<string, number> = {};
+// 断线 / 切回前台 / 服务重启后对账：整窗合并，多出来的行按 seq 去重。
+export function reconcile(id?: string) {
+  const tid = String(id || selectedTask.value?.id || "");
+  if (tid) loadHistory(tid);
+}
+
 function scheduleHistory(id: string, ms = 600) {
   window.clearTimeout(fetchTimers[id]);
-  fetchTimers[id] = window.setTimeout(() => loadRounds(id), ms);
+  fetchTimers[id] = window.setTimeout(() => loadHistory(id), ms);
 }
 
-// ---- 增量：SSE 行 → 轮 / 动作 ----
-export const raws = ref<Record<string, RawLine[]>>({});
-
-function roundFor(id: string, msgId: string, at = ""): TermRound {
-  const list = rounds.value[id] || (rounds.value[id] = []);
-  let cur = list.find((r) => r.msgId === msgId);
-  if (!cur) {
-    cur = { i: (list.length ? list[list.length - 1].i : 0) + 1, msgId, at, status: "ok", think: "", say: "", actions: [] };
-    list.push(cur);
-  }
-  return cur;
-}
-
-function applyLine(id: string, l: RawLine) {
-  const list = rounds.value[id] || (rounds.value[id] = []);
-  if (l.msgId) {
-    const r = roundFor(id, l.msgId, l.at || "");
-    if (l.kind === "think") r.think = [r.think, l.text].filter(Boolean).join("\n\n").slice(0, 4000);
-    else if (l.kind === "say") r.say = [r.say, l.text].filter(Boolean).join("\n\n").slice(0, 2000);
-    else if (l.kind === "cmd") {
-      const aid = l.actionId || `live-${r.actions.length}`;
-      if (!r.actions.some((a) => a.id === aid)) {
-        r.actions.push({ id: aid, tool: l.tool || "", input: l.input || {}, ok: true, out: "", err: null, at: l.at || "" });
-      }
-    }
-    return;
-  }
-  if ((l.kind === "out" || l.kind === "err") && l.actionId) {
-    for (const r of list) {
-      const a = r.actions.find((x) => x.id === l.actionId);
-      if (!a) continue;
-      a.ok = l.kind !== "err";
-      a.out = l.text || a.out;
-      if (!a.ok) { a.err = l.text || ""; r.status = "error"; }
-      return;
-    }
-    return;
-  }
-  if (l.kind === "report") {
-    const h = hist.value[id] || emptyHist();
-    const end = h.end || { status: "ok", result: "" };
-    hist.value = { ...hist.value, [id]: { ...h, end: { ...end, result: l.text || "" } } };
-  }
-}
-
-// SSE /events/losflow 的入口：增量追加，不再整包替换
+// ---- SSE 入口 ----
 export function applyStream(e: any) {
   const id = String(e?.taskId || "");
   if (!id) return;
   if (e.kind === "run") {
     if (e.reset) {
-      raws.value = { ...raws.value, [id]: [] };
-      rounds.value = { ...rounds.value, [id]: [] };
+      epochs[id] = (epochs[id] || 0) + 1;
+      lines.value = { ...lines.value, [id]: [] };
+      hist.value = { ...hist.value, [id]: emptyHist() };
       // 只给当前选中的会话补历史；其余会话等点开时再按需取
       if (selectedTask.value && selectedTask.value.id === id) scheduleHistory(id, 300);
     }
     return;
   }
   if (e.kind === "line" && e.line) {
-    const cur = raws.value[id] || (raws.value[id] = []);
-    cur.push(e.line as RawLine);
-    if (cur.length > 3000) cur.splice(0, cur.length - 3000);
+    const cur = lines.value[id] || [];
+    lines.value = { ...lines.value, [id]: mergeLines(cur, [e.line as RawLine]) };
     lastEventAt.value = { ...lastEventAt.value, [id]: Date.now() };
-    applyLine(id, e.line as RawLine);
     if (isFollowing(id)) followToBottom(id);
     else pendingNew.value = { ...pendingNew.value, [id]: (pendingNew.value[id] || 0) + 1 };
     return;
   }
   if (e.kind === "end") {
-    // 结束：让服务端给一份最终结构（stats / end / 最终窗口）
     if (selectedTask.value && selectedTask.value.id === id) scheduleHistory(id, 800);
     refresh();
   }
+}
+
+// ---- 日志行 / 筛选 ----
+export const lineFilter = ref<"all" | "changes" | "errors" | "commands">("all");
+export const search = ref("");
+
+export function rowsOf(id: string): LogRow[] {
+  return buildLogRows(lines.value[id] || []);
+}
+
+export function visibleRows(id: string): LogRow[] {
+  const q = search.value.trim();
+  let out = rowsOf(id);
+  if (lineFilter.value === "errors") {
+    out = out.filter((r) => r.kind === "err" || (r.kind === "cmd" && r.ok === false) || (r.kind === "end" && /error|失败/i.test(r.text)));
+  } else if (lineFilter.value === "changes") {
+    out = out.filter((r) => r.kind === "cmd" && isChangedTool(r.tool || "", r.input));
+  } else if (lineFilter.value === "commands") {
+    out = out.filter((r) => r.kind === "cmd");
+  }
+  if (q) out = out.filter((r) => rowMatches(r, q));
+  return out;
+}
+
+export function statsOf(id: string) {
+  const rows = rowsOf(id);
+  const ls = logStats(rows);
+  const base = hist.value[id]?.stats;
+  return {
+    actions: ls.actions,
+    errors: ls.errors,
+    files: ls.files,
+    turns: base?.turns || 0,
+    durationMs: base?.durationMs || 0,
+    cost: base?.cost ?? null,
+  };
+}
+
+export function anomaliesOf(id: string) {
+  return logAnomalies(rowsOf(id), {
+    running: isRunning(id),
+    lastEventAt: Math.max(lastEventAt.value[id] || 0, hist.value[id]?.stats?.lastEventAt || 0),
+    now: nowMs.value,
+  });
 }
 
 // ---- 滚动跟随 ----
@@ -247,59 +321,6 @@ function followToBottom(id: string) {
     scrollBottom(id);
   });
 }
-export function toRound(id: string, roundIndex: number) {
-  const el = document.getElementById(`round-${id}-${roundIndex}`);
-  if (el) el.scrollIntoView({ block: "center", behavior: "smooth" });
-}
-
-// ---- 折叠 / 筛选 / 搜索 ----
-export const roundFilter = ref<"all" | "changes" | "errors" | "commands">("all");
-export const search = ref("");
-const roundToggles = reactive<Record<string, Record<number, boolean>>>({});
-const expandAllSet = reactive<Record<string, boolean>>({});
-
-export function visibleRounds(id: string): TermRound[] {
-  const list = rounds.value[id] || [];
-  const q = search.value.trim();
-  let out = list;
-  if (roundFilter.value === "errors") out = out.filter((r) => r.status === "error" || r.actions.some((a) => !a.ok));
-  else if (roundFilter.value === "changes") out = out.filter((r) => r.actions.some((a) => isChangedTool(a.tool, a.input)));
-  else if (roundFilter.value === "commands") out = out.filter((r) => r.actions.length > 0);
-  if (q) out = out.filter((r) => roundMatches(r, q));
-  return out;
-}
-
-export function isRoundOpen(id: string, r: TermRound, isLast: boolean): boolean {
-  if (search.value.trim()) return true;
-  if (expandAllSet[id] === true) return true;
-  if (expandAllSet[id] === false) return !!roundToggles[id]?.[r.i];
-  const forced = roundToggles[id]?.[r.i];
-  if (forced !== undefined) return forced;
-  return isLast || r.status === "error";
-}
-export function toggleRound(id: string, i: number, fallback: boolean) {
-  const cur = roundToggles[id] || (roundToggles[id] = {});
-  cur[i] = !(cur[i] ?? fallback);
-}
-export function expandAll(id: string) {
-  expandAllSet[id] = true;
-  roundToggles[id] = {};
-}
-export function collapseAll(id: string) {
-  expandAllSet[id] = false;
-  roundToggles[id] = {};
-}
-
-export function statsOf(id: string) {
-  return roundStats(rounds.value[id] || []);
-}
-export function anomaliesOf(id: string) {
-  return anomalies(rounds.value[id] || [], {
-    running: isRunning(id),
-    lastEventAt: Math.max(lastEventAt.value[id] || 0, hist.value[id]?.stats?.lastEventAt || 0),
-    now: nowMs.value,
-  });
-}
 
 // ---- 全屏 ----
 export const fullTerm = ref<string | null>(null);
@@ -323,17 +344,19 @@ export async function delRun(t: Task) {
     title: `删除 #${t.id} 的这次会话？`,
     body: runId,
     detail:
-      "会一起删：WSL /tmp 里的脚本/日志/流、data/streams 回放归档、tools/runs 归档、台账里这一行、任务上的会话指针（之后再跑是「新会话」）。\n台账这行删掉后，今天的花费统计也会少这一笔。",
+      "会一起删：运行中的临时流（WSL /tmp 或 Windows data/runstate）、data/streams 回放归档、runs 归档、台账里这一行、任务上的会话指针（之后再跑是「新会话」）。\n台账这行删掉后，今天的花费统计也会少这一笔。",
     okText: "删除",
     danger: true,
   });
   if (!ok) return;
   try {
     const r = await post("/api/run/delete", { id: runId, taskId: t.id });
-    flash(`已删：WSL ${r.wslFiles} 个文件 · 归档 ${r.removedRun ? 1 : 0} · 台账 ${r.ledgerRemoved} 行 · 清掉 ${r.clearedTasks} 条会话指针`);
+    flash(
+      `已删：${r.env === "windows" ? "Windows" : "WSL"} ${r.wslFiles || 0} 个文件 · 运行态 ${r.removedRunstate ? 1 : 0} · 归档 ${r.removedRun ? 1 : 0} · 台账 ${r.ledgerRemoved} 行 · 清掉 ${r.clearedTasks} 条会话指针`
+    );
     termGone.value = { ...termGone.value, [t.id]: true };
-    delete raws.value[t.id];
-    delete rounds.value[t.id];
+    epochs[t.id] = (epochs[t.id] || 0) + 1;
+    delete lines.value[t.id];
     delete hist.value[t.id];
     setTimeout(refresh, 300);
   } catch (e: any) {
@@ -342,17 +365,12 @@ export async function delRun(t: Task) {
 }
 
 export async function copyTerm(id: string) {
-  const rs = rounds.value[id] || [];
-  const text = rs.length
-    ? rs
-        .map((r) =>
-          [r.think, r.say, ...r.actions.map((a) => [a.tool, JSON.stringify(a.input || {}), a.out].filter(Boolean).join(" "))].filter(Boolean).join("\n")
-        )
-        .join("\n\n")
-    : (raws.value[id] || []).map((l) => l.text).join("\n");
+  const rows = rowsOf(id);
+  const text = logText(rows);
+  if (!text) return flash("这条会话还没有内容可复制", true);
   try {
     await navigator.clipboard.writeText(text);
-    flash(`已复制 #${id} 的 ${rs.length ? rs.length + " 轮" : (raws.value[id] || []).length + " 行"}`);
+    flash(`已复制 #${id} 的 ${rows.length} 行日志`);
   } catch {
     flash("复制失败（浏览器不给剪贴板权限）", true);
   }

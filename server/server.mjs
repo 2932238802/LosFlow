@@ -17,11 +17,15 @@ import { readFileSync, existsSync, writeFileSync, readdirSync, statSync } from "
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadPaths } from "./paths.mjs";
+import { resolveEnv } from "./env.mjs";
 import * as pool from "./pool.mjs";
 import * as approvals from "./approvals.mjs";
 import * as events from "./events.mjs";
 import * as dispatch from "./dispatch.mjs";
 import * as docsync from "./docsync.mjs";
+import * as jobs from "./jobs.mjs";
+import * as skills from "./skills.mjs";
+import * as notify from "./notify.mjs";
 import { mutate } from "./store.mjs";
 import { renderMarkdown, wikiPage } from "./wiki.mjs";
 
@@ -33,12 +37,47 @@ approvals.initApprovals(PATHS);
 events.initEvents(PATHS);
 dispatch.initDispatch(PATHS);
 docsync.initDocsync(PATHS);
+jobs.initJobs(PATHS);
+skills.initSkills(PATHS);
+notify.initNotify(PATHS, {
+  isPending: (id) => approvals.loadApprovals().some((a) => String(a.id) === String(id) && a.status === "pending"),
+});
+
+// 实时审批：MCP 把请求写进 data/live，审批队列扫描后广播给右侧栏。
+// 降级 C：live 没接住（关闭 / MCP 异常）时，流里一出现 reject 就立刻入队。
+approvals.startLiveWatch((evt) => events.broadcast(evt), (id) => dispatch.getTask(id));
+events.setDenialSink((d) => {
+  try {
+    const task = dispatch.getTask(d.taskId);
+    approvals.recordMidRunDenial({
+      ...d,
+      task: task ? [task.subject, task.note].filter(Boolean).join("\n\n") : "",
+      repo: (task && task.repo) || "",
+      env: task ? envOfTask(task) : "",
+      mode: "read",
+    });
+  } catch {
+    /* 入队失败不影响终端流 */
+  }
+});
 
 const FILES = {
   tasks: join(PATHS.dataDir, "Vesta.tasks.json"),
   calls: join(PATHS.dataDir, "calls.jsonl"),
   ledger: join(PATHS.dataDir, "claude-ledger.jsonl"),
 };
+
+// ---- 环境判定（唯一入口：server/env.mjs）----
+// 任务上的 env 是「模式」：'' / 'auto' 按 repo 现算；'wsl' / 'windows' 是派单时固化的结果。
+const defaultEnv = () => PATHS.defaultEnv || "wsl";
+function envOfTask(t) {
+  const mode = t && t.env ? String(t.env) : "";
+  return resolveEnv(t && t.repo, mode === "auto" ? "" : mode, defaultEnv());
+}
+function publicProject(p) {
+  const mode = p && p.env ? String(p.env) : "auto";
+  return { ...p, env: mode, resolvedEnv: resolveEnv(p && p.path, mode === "auto" ? "" : mode, defaultEnv()) };
+}
 
 function readJson(p, fallback) {
   try {
@@ -95,31 +134,122 @@ const DEFAULT_TEMPLATES = {
   splitSystem: "你是任务拆分助手：把一条任务拆成 3-6 条可独立执行、可独立验收的子任务，粒度适中，不要互相依赖。",
   optimizeSystem: "你是提示词优化助手：把用户的草稿改写成一条能直接交给 Claude Code 执行的派单指令，说清做什么 / 照哪做 / 怎么验 / 要回执，只输出改写后的指令。",
 };
-function optimizeViaGateway(prompt, systemText) {
-  return new Promise((resolve) => {
-    const tmp = PATHS.tempDir || "D:\\Temp";
-    const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-    const reqFile = join(tmp, "opt-" + id + ".json");
-    const body = {
-      model: "__MODEL__",
-      max_tokens: 1200,
-      system: systemText || "",
-      messages: [{ role: "user", content: prompt }],
-    };
-    writeFileSync(reqFile, JSON.stringify(body), "utf8");
-    const script = [
-      "set -e",
-      'eval "$(grep -E \'^export ANTHROPIC_\' /usr/bin/start_claude_code_jz)"',
-      'body=$(cat ' + reqFile + ' | sed "s/__MODEL__/$ANTHROPIC_MODEL/")',
-      'curl -s --max-time 90 -X POST "$ANTHROPIC_BASE_URL/v1/messages" ' +
-        '-H "x-api-key: $ANTHROPIC_API_KEY" -H "anthropic-version: 2023-06-01" ' +
-        '-H "content-type: application/json" -d "$body"',
-    ].join("\n");
-    runWsl(script).then((r) => {
-      try { unlinkSync(reqFile); } catch {}
-      resolve({ ok: r.code === 0, raw: r.out, err: r.err });
+
+// ---- 网关配置（元调用直连，去 WSL 单点）----
+// 优先级：losflow.config.json 的 windowsClaudeEnv → 本机环境变量 → WSL 启动器（旧兜底）。
+// 以前 server.mjs 从 WSL 里 grep start_claude_code_jz 取 key：WSL 一停，优化/拆分/文档全跟着挂。
+let gatewayCache = { at: 0, cfg: null };
+function nowStamp() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+async function gatewayFromWsl() {
+  const script = [
+    'eval "$(grep -E \'^export ANTHROPIC_\' /usr/bin/start_claude_code_jz)" 2>/dev/null',
+    'echo "$ANTHROPIC_BASE_URL"',
+    'echo "$ANTHROPIC_API_KEY"',
+    'echo "$ANTHROPIC_MODEL"',
+  ].join("\n");
+  const r = await runWsl(script);
+  const [base = "", key = "", model = ""] = String(r.out || "").split("\n").map((x) => x.trim());
+  return { base, key, model };
+}
+
+async function gatewayConfig() {
+  if (gatewayCache.cfg && Date.now() - gatewayCache.at < 5 * 60 * 1000) return gatewayCache.cfg;
+  const src = PATHS.windowsClaudeEnv || {};
+  let base = src.ANTHROPIC_BASE_URL || process.env.ANTHROPIC_BASE_URL || "";
+  let key = src.ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY || "";
+  let model = src.ANTHROPIC_MODEL || process.env.ANTHROPIC_MODEL || "";
+  if (!base || !key) {
+    const w = await gatewayFromWsl();
+    base = base || w.base;
+    key = key || w.key;
+    model = model || w.model;
+  }
+  const cfg = base && key ? { base, key, model } : null;
+  gatewayCache = { at: Date.now(), cfg };
+  return cfg;
+}
+
+// 元调用（提示词优化 / 拆分 / 文档）只需要一次纯文本补全：直连网关即可。
+// 回执不带金额，记一行 cost_usd=null（billing=unknown）留痕，spendToday 会跳过它。
+async function metaChat(prompt, systemText = "") {
+  const g = await gatewayConfig();
+  if (!g) return { ok: false, raw: "", err: "gateway not configured (windowsClaudeEnv / WSL launcher unavailable)", via: "" };
+  try {
+    const url = g.base.replace(/\/+$/, "") + "/v1/messages";
+    const res = await fetch(url, {
+      method: "POST",
+      // 元调用不能无限挂着：网关不通 / WSL 没起来时 90 s 内明确失败，调用方（job）才有终态
+      signal: AbortSignal.timeout(90 * 1000),
+      headers: { "content-type": "application/json", "x-api-key": g.key, "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({
+        model: g.model || "deepseek-v4-flash",
+        max_tokens: 1600,
+        system: systemText || "",
+        messages: [{ role: "user", content: prompt }],
+      }),
     });
-  });
+    const text = await res.text();
+    let j = null;
+    try { j = JSON.parse(text); } catch { /* keep raw */ }
+    const raw = j && Array.isArray(j.content) ? j.content.filter((b) => b && b.type === "text").map((b) => b.text || "").join("") : "";
+    const ok = res.ok && !!raw.trim();
+    try {
+      appendFileSync(FILES.ledger, JSON.stringify({
+        id: "meta-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 6),
+        at: nowStamp(), task_id: "", env: "gateway", repo: "", mode: "meta",
+        status: ok ? "ok" : "error", cost_usd: null, billing: "unknown",
+        model: g.model || "", result_preview: String(raw || "").slice(0, 200), result_len: String(raw || "").length,
+        error: ok ? "" : String(text || "").slice(0, 300),
+        task_preview: "(meta call)",
+      }) + "\n", "utf8");
+    } catch { /* 记账失败不影响元调用 */ }
+    return { ok, raw: ok ? raw : text.slice(0, 400), err: ok ? "" : text.slice(0, 300), via: "gateway" };
+  } catch (e) {
+    const timeout = e && (e.name === "TimeoutError" || e.name === "AbortError");
+    return { ok: false, raw: "", err: timeout ? "网关 90 秒无响应" : e.message, via: "gateway" };
+  }
+}
+
+// 元调用优先直连网关；配置不可用 / 网关报错时退回旧派单链路（保持可用性）。
+async function metaOrDispatch(prompt, fallbackOpts = {}) {
+  const m = await metaChat(prompt, "");
+  if (m.ok && String(m.raw || "").trim()) {
+    return { dispatch: { status: "ok", cost: null, via: m.via || "gateway" }, raw: String(m.raw).trim() };
+  }
+  const r = await dispatch.runDispatch({ task: prompt, mode: "read", ...fallbackOpts });
+  return { dispatch: r, raw: r.result || "" };
+}
+
+// 兼容旧调用点：名字保留，内部改成直连（失败时退回原来的 WSL curl）。
+async function optimizeViaGateway(prompt, systemText) {
+  const r = await metaChat(prompt, systemText);
+  if (r.ok || r.raw) return r;
+  const tmp = PATHS.tempDir || "D:\\Temp";
+  const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  const reqFile = join(tmp, "opt-" + id + ".json");
+  const body = {
+    model: "__MODEL__",
+    max_tokens: 1200,
+    system: systemText || "",
+    messages: [{ role: "user", content: prompt }],
+  };
+  writeFileSync(reqFile, JSON.stringify(body), "utf8");
+  const script = [
+    "set -e",
+    'eval "$(grep -E \'^export ANTHROPIC_\' /usr/bin/start_claude_code_jz)"',
+    'body=$(cat ' + reqFile + ' | sed "s/__MODEL__/$ANTHROPIC_MODEL/")',
+    'curl -s --max-time 90 -X POST "$ANTHROPIC_BASE_URL/v1/messages" ' +
+      '-H "x-api-key: $ANTHROPIC_API_KEY" -H "anthropic-version: 2023-06-01" ' +
+      '-H "content-type: application/json" -d "$body"',
+  ].join("\n");
+  const w = await runWsl(script);
+  try { unlinkSync(reqFile); } catch { /* ignore */ }
+  return { ok: w.code === 0, raw: w.out, err: w.err, via: "wsl" };
 }
 
 function runWsl(cmd) {
@@ -245,10 +375,38 @@ function saveTemplates(tpl) {
   writeFileSync(join(PATHS.dataDir, "prompt-templates.json"), JSON.stringify(tpl, null, 2), "utf8");
 }
 
+// 拆分提示词：正文、字段契约与硬规则都在 docs/skills/split.md（可编辑、可 diff）。
+// 路由只负责把 任务 / 说明 / 补充要求 填进占位符；缺文件时 skills.mjs 会写内置默认。
+function buildSplitPrompt(item, extra = "") {
+  const skill = skills.loadSkill("split");
+  return skills.renderSplitPrompt(skill, { title: item.title, note: item.note || "", extra });
+}
+
+// 给前端的 SKILL 视图：不暴露解析内部结构，只给名字/路径/正文/字段/错误
+function publicSkill(s) {
+  return {
+    name: s.name,
+    path: s.path,
+    content: s.content,
+    output: s.meta ? s.meta.output : "text",
+    fields: s.meta ? s.meta.fields : [],
+    error: s.error || "",
+  };
+}
+
+function skillsPreview() {
+  const s = skills.loadSkill("split");
+  return skills.renderSplitPrompt(s, {
+    title: "示例任务标题",
+    note: "示例任务本身（正文）",
+    extra: "",
+  });
+}
+
 function loadProjects() {
   const file = join(PATHS.dataDir, "projects.json");
   if (!existsSync(file)) {
-    const seed = [{ id: "vesta", name: "Vesta", path: "~/LosAngelous/Vesta" }];
+    const seed = [{ id: "vesta", name: "Vesta", path: "~/LosAngelous/Vesta", env: "auto" }];
     writeFileSync(file, JSON.stringify(seed, null, 2), "utf8");
     return seed;
   }
@@ -261,6 +419,41 @@ function loadProjects() {
 }
 function saveProjects(list) {
   writeFileSync(join(PATHS.dataDir, "projects.json"), JSON.stringify(list, null, 2), "utf8");
+}
+
+// ---- 机器相关配置（losflow.config.json）：只开放派单环境相关的非敏感字段 ----
+// windowsClaudeEnv 里有网关 key：既不返回也不接收，只能手工写进 gitignored 的配置文件。
+const configFile = () => join(PATHS.root, "losflow.config.json");
+function publicConfig() {
+  let envKeys = [];
+  try { envKeys = Object.keys(PATHS.windowsClaudeEnv || {}); } catch { /* ignore */ }
+  return {
+    defaultEnv: PATHS.defaultEnv || "wsl",
+    windowsClaudeCmd: PATHS.windowsClaudeCmd || "",
+    claudeTimeoutSec: Number(PATHS.claudeTimeoutSec) || 600,
+    wslDistro: PATHS.wslDistro || "",
+    wslRepo: PATHS.wslRepo || "",
+    // 只说明配了哪些变量名，值永远不返回
+    windowsClaudeEnvKeys: envKeys,
+  };
+}
+function saveConfig(b) {
+  let cur = {};
+  try { cur = JSON.parse(readFileSync(configFile(), "utf8")); } catch { cur = {}; }
+  if (typeof b.defaultEnv === "string" && (b.defaultEnv === "wsl" || b.defaultEnv === "windows")) {
+    cur.defaultEnv = b.defaultEnv;
+  }
+  if (typeof b.windowsClaudeCmd === "string") cur.windowsClaudeCmd = b.windowsClaudeCmd.trim();
+  if (typeof b.claudeTimeoutSec !== "undefined") {
+    const n = Number(b.claudeTimeoutSec) || 600;
+    cur.claudeTimeoutSec = Math.max(30, Math.min(3600, Math.round(n)));
+  }
+  writeFileSync(configFile(), JSON.stringify(cur, null, 2) + "\n", "utf8");
+  // 运行中的进程立刻生效；PowerShell 每次派单都会重新读配置文件
+  PATHS.defaultEnv = cur.defaultEnv === "windows" ? "windows" : "wsl";
+  PATHS.windowsClaudeCmd = cur.windowsClaudeCmd || "";
+  PATHS.claudeTimeoutSec = Number(cur.claudeTimeoutSec) || 600;
+  return { config: publicConfig() };
 }
 
 function wbActivityByTask(rows) {
@@ -337,13 +530,35 @@ const scanScript = () => toWslPath(join(PATHS.serverDir, "scan-terminals.sh"));
 
 let scanBusy = false;
 let lastScanAt = 0;
+
+// 本机 Windows 派单：读 data/runstate/*.json，用 process.kill(pid, 0) 探活。
+// WSL 的 pid 是 WSL 里的，交给 scan-terminals.sh；两边合并后 items[].env 标明归属。
+function scanWindowsRunStates() {
+  const items = [];
+  const live = new Set();
+  for (const st of dispatch.listRunStates()) {
+    if (st.env !== "windows") continue;
+    if (!dispatch.pidAlive(st.pid)) continue;
+    items.push({
+      id: String(st.id),
+      pid: Number(st.pid) || 0,
+      startedAt: st.startedAt || "",
+      env: "windows",
+      taskId: String(st.taskId || ""),
+      repo: st.repo || "",
+    });
+    live.add(String(st.id));
+  }
+  return { items, live };
+}
+
 async function scanTerminals() {
   // 走脚本文件，不要内联带引号的命令：wsl.exe 会吃掉内层引号
   let items = [];
-  let ok = false;
+  let wslOk = false;
   try {
     const r = await runWsl(`bash ${scanScript()}`);
-    ok = r.code === 0;
+    wslOk = r.code === 0;
     items = String(r.out || "")
       .split("\n")
       .map((s) => s.trim())
@@ -353,16 +568,29 @@ async function scanTerminals() {
         const id = String(rawId || "").replace(/^cc-/, "");
         const m = /^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})-/.exec(id);
         const startedAt = m ? `${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]}:${m[6]}` : "";
-        return { id, pid: Number(pid) || 0, startedAt };
+        return { id, pid: Number(pid) || 0, startedAt, env: "wsl" };
       });
   } catch {
     items = [];
   }
+
+  // 本地 runstate 永远可读；WSL 挂了也不能因此把 Windows 的运行算成「死」
+  let local = { items: [] };
+  let localOk = false;
+  try {
+    local = scanWindowsRunStates();
+    localOk = true;
+  } catch { /* ignore */ }
+  items = items.concat(local.items);
+  // 异常退出的 runstate 由这里兜底清掉（进程已不在且超过 30 分钟宽限期）
+  try { dispatch.pruneRunStates(); } catch { /* ignore */ }
+  const ok = wslOk || localOk;
   terminalsCache = { at: Date.now(), data: { count: items.length, items, ok } };
 }
 
 // /api/state 永远读缓存，扫描放后台：5s 轮询不再有 100ms 级的 wsl.exe 尖刺。
-// 首次请求拿到的是空扫描（ok=false，不据此判定 running.json 过期），一两个轮询后补齐。
+// 本地 runstate 除外——读目录 + process.kill(pid,0) 成本极低，每次现读，
+// 刚起的 Windows 会话立刻出现在终端页，终止后也立刻消失。
 function terminalRuns() {
   if (Date.now() - lastScanAt >= 20000 && !scanBusy) {
     scanBusy = true;
@@ -371,7 +599,11 @@ function terminalRuns() {
       scanBusy = false;
     });
   }
-  return terminalsCache.data;
+  const base = terminalsCache.data;
+  let local = { items: [] };
+  try { local = scanWindowsRunStates(); } catch { /* ignore */ }
+  const items = (base.items || []).filter((x) => x.env !== "windows").concat(local.items);
+  return { ...base, count: items.length, items };
 }
 
 // running.json 由派单脚本写，脚本被强杀/异常退出时可能留下来（显示「执行中」但早已没有进程）。
@@ -394,6 +626,12 @@ function liveRunning(running, terminals) {
 function liveRunByTask(terminals, running) {
   const live = new Set((terminals?.items || []).map((x) => String(x.id)));
   const map = {};
+  // 本机 Windows 的 runstate 自带 taskId：正在跑、台账还没落行时也能认领
+  try {
+    for (const st of dispatch.liveWindowsRuns()) {
+      if (st.taskId) map[String(st.taskId)] = String(st.id);
+    }
+  } catch { /* ignore */ }
   for (const [taskId, row] of Object.entries(dispatch.latestRunsByTask())) {
     if (row && live.has(String(row.id))) map[taskId] = String(row.id);
   }
@@ -412,15 +650,25 @@ async function streamTargets() {
   const latest = dispatch.latestRunsByTask();
   const starts = dispatch.pendingStarts();
   const live = new Set((terminals?.items || []).map((x) => String(x.id)));
+  // 本机 Windows 的运行不会写 running.json 之外的地方，且并发时 running.json 只留最后一条；
+  // runstate 按 taskId 记着谁在跑，优先用它。
+  const localLive = {};
+  try {
+    for (const st of dispatch.liveWindowsRuns()) {
+      if (st.taskId) localLive[String(st.taskId)] = String(st.id);
+      live.add(String(st.id));
+    }
+  } catch { /* ignore */ }
   const isLive = (runId) =>
     !!runId &&
-    ((running && String(running.id) === runId) || (terminals.ok !== false && live.has(runId)));
+    ((running && String(running.id) === runId) || (terminals.ok !== false && live.has(runId)) || Object.values(localLive).includes(runId));
   const out = [];
   for (const t of tasks) {
     if (t.docOnly) continue;
     const id = String(t.id);
     let runId = "";
-    if (running && String(running.taskId || "") === id && running.id) runId = String(running.id);
+    if (localLive[id]) runId = localLive[id];
+    else if (running && String(running.taskId || "") === id && running.id) runId = String(running.id);
     else if (latest[id] && latest[id].id) runId = String(latest[id].id);
     if (!runId) continue;
     out.push({
@@ -449,8 +697,10 @@ async function buildState() {
       id: r.id || "",
       at: r.at || "",
       status: r.status || "",
-      cost: Number(r.cost_usd || 0),
+      // 回执缺金额（null）时保持 null，前端显示「—」而不是假的 $0.000
+      cost: r.cost_usd === null || r.cost_usd === undefined ? null : Number(r.cost_usd),
       turns: Number(r.turns || 0),
+      env: r.env || "wsl",
     };
   }
   const doc = docsync.summary();
@@ -464,7 +714,8 @@ async function buildState() {
   return {
     now: new Date().toISOString(),
     running,
-    projects: loadProjects(),
+    projects: loadProjects().map(publicProject),
+    defaultEnv: defaultEnv(),
     maintenance: loadMaint(),
     pool: pool.loadPool(),
     docsync: doc,
@@ -472,6 +723,7 @@ async function buildState() {
     history,
     approvals: approvals.loadApprovals().slice(-20).reverse(),
     allowlist: approvals.loadAllowlist(),
+    notify: notify.status(),
     tasks: tasks.map((t) => {
       const id = String(t.id);
       const st = starts[id];
@@ -485,6 +737,13 @@ async function buildState() {
         evidence: t.evidence || "",
         note: t.note || "",
         repo: t.repo || "",
+        // 派单执行环境：'auto' / 空按 repo 现算，'wsl' / 'windows' 是派单时固化的结果
+        env: envOfTask(t),
+        envMode: t.env || "auto",
+        sessionEnv: t.sessionEnv || "",
+        lastError: t.lastError || "",
+        lastErrorAt: t.lastErrorAt || null,
+        lastErrorStatus: t.lastErrorStatus || "",
         kind: t.kind || "personal",
         // 文档同步类任务：只走 docsync 队列 → WorkBuddy，不进任务页 / 终端页
         docOnly: !!t.docOnly,
@@ -551,48 +810,126 @@ async function startDispatch(b, cont) {
   assertDispatchable(task);
   if (cont && !task.sessionId) throw new Error("这条任务还没有自己的会话，先点「执行」开一个");
   if (dispatch.isStarting(b.id)) throw new Error("这条正在启动中，稍等（别连点，会重复花费）");
+  const env = envOfTask(task);
+  // 会话不跨环境：上次是 WSL 的 session_id，这次派到 Windows 就没法续
+  const sessionEnv = task.sessionEnv || "";
+  const envChanged = !!task.sessionId && !!sessionEnv && sessionEnv !== env;
+  if (cont && envChanged) {
+    throw new Error(`环境已变（上次 ${sessionEnv}，这次 ${env}），请新开会话`);
+  }
   await dispatch.markStarting(b.id, cont ? "continue" : "dispatch");
+  // 派单时把判定结果固化到任务上，之后改路径不追溯（改 repo 会重置成 auto）
+  await dispatch.setTaskTask(b.id, { env });
   const run = {
     task: b.task || task.note || task.subject,
     mode: cont ? "read" : b.mode === "write" ? "write" : "read",
     allow: b.allow || "",
     repo: task.repo,
     taskId: b.id,
-    resume: task.sessionId || "",
+    // 环境变了就不续旧会话（否则 --resume 必失败）；前端据此提示「已开新会话」
+    resume: envChanged ? "" : task.sessionId || "",
+    env,
   };
   setImmediate(() => {
     dispatch
       .runDispatch(run)
       .then(async (r) => {
-        if (r && r.session_id) await dispatch.setTaskTask(b.id, { sessionId: r.session_id });
+        if (r && r.session_id) await dispatch.setTaskTask(b.id, { sessionId: r.session_id, sessionEnv: r.env || env });
+        // 回执 ok 才清错误；preflight / error 留在任务上，前端能看见「检查未通过，未产生花费」
+        const bad = r && r.status && r.status !== "ok" && r.status !== "deduped";
+        if (bad) {
+          await dispatch.setTaskTask(b.id, {
+            lastError: String(r.error || r.stderr || r.status || "").slice(0, 400),
+            lastErrorAt: Date.now(),
+            lastErrorStatus: r.status || "",
+          });
+        } else if (r) {
+          await dispatch.setTaskTask(b.id, { lastError: "", lastErrorAt: null, lastErrorStatus: "" });
+        }
         syncBrain(b.id, task.subject, r);
       })
       .catch((err) => syncBrain(b.id, task.subject, { status: "failed", error: err.message }))
       .finally(() => dispatch.clearStarting(b.id));
   });
-  return { started: true, taskId: String(b.id) };
+  return { started: true, taskId: String(b.id), env, newSession: envChanged };
 }
 
 const ROUTES = {
-  "/api/pool/add": (b) => pool.addPool({ title: b.title, note: b.note, kind: b.kind, project: b.project, type: b.type }),
-  "/api/pool/toggle": (b) => pool.toggleConfirm({ id: b.id, field: b.field }),
+  "/api/pool/add": (b) => pool.addPool({ title: b.title, note: b.note, kind: b.kind, project: b.project, type: b.type, workType: b.workType }),
+  "/api/pool/worktype": (b) => pool.setWorkType({ id: b.id, workType: b.workType }),
   "/api/pool/apply": (b) => pool.applySplit({ id: b.id, subs: b.subs }),
+  // 拆分改成后台 job：请求 200 ms 内返回 jobId，后台跑；关弹层 / 切页 / 刷新都不丢结果。
+  // 同一池子条目在 running 时再点 → 返回同一个 jobId（reused），不产生第二次花费。
+  // 传 sync:1 仍可拿旧行为（等结果），仅供旧前端/排查，下一版删。
   "/api/pool/suggest": async (b) => {
     const item = pool.loadPool().find((x) => x.id === b.id);
     if (!item) throw new Error("没有这条任务");
-    const tpl = loadTemplates();
-    const prompt = [
-      tpl.splitSystem,
-      "",
-      `任务：${item.title}`,
-      item.note ? `说明：${item.note}` : "",
-      b.prompt ? `补充要求：${b.prompt}` : "",
-      "",
-      "只输出严格 JSON 数组，不要解释、不要代码块：",
-      '[{"title":"子任务标题","owner":"claude-code 或 workbuddy","reason":"为什么单独拆"}]',
-    ].filter(Boolean).join("\n");
-    const r = await dispatch.runDispatch({ task: prompt, mode: "read", repo: item.project, taskId: b.id, budget: 0.35 });
-    return { dispatch: r, raw: r.result || "" };
+    const prompt = buildSplitPrompt(item, b.prompt);
+    const fallbackOpts = { repo: item.project, env: resolveEnv(item.project, "", defaultEnv()), taskId: item.id, budget: 0.35 };
+
+    if (b.sync) {
+      const r = await metaOrDispatch(prompt, fallbackOpts);
+      return { dispatch: r.dispatch, raw: r.raw };
+    }
+
+    const job = jobs.startJob({
+      kind: "pool.suggest",
+      key: item.id,
+      label: `拆分 · ${item.title}`,
+      // 网关 90 s 无响应会先失败；这里再兜一层，保证界面上一定有终态
+      timeoutMs: 120 * 1000,
+      // 超时收尾：如果已经退回到 Claude Code 派单，且正在跑的就是这条池子条目，顺手停掉
+      abort: () => {
+        const live = readJson(join(PATHS.dataDir, "running.json"), null);
+        if (live && live.id && String(live.taskId || "") === String(item.id)) dispatch.stopRun(live.id);
+      },
+      run: async () => {
+        const r = await metaOrDispatch(prompt, fallbackOpts);
+        const raw = String(r.raw || "").trim();
+        const st = r.dispatch && r.dispatch.status;
+        if (!raw && st && st !== "ok" && st !== "deduped") {
+          throw new Error(String(r.dispatch.error || r.dispatch.status || "AI 调用失败"));
+        }
+        return r;
+      },
+    });
+    return { jobId: job.id, reused: job.reused };
+  },
+  // 编辑池子条目的「任务本身」（正文）。拆出来的空壳就是靠这个入口补回来。
+  "/api/pool/note": (b) => pool.setNote({ id: b.id, note: b.note }),
+  // 拆分前的「优化」：把需求补全（不拆），结果写回父条目正文，关弹层也不丢。
+  "/api/pool/optimize": async (b) => {
+    const item = pool.loadPool().find((x) => x.id === b.id);
+    if (!item) throw new Error("没有这条任务");
+    const skill = skills.loadSkill("split-optimize");
+    const input = [item.title, item.note || ""].filter((x) => String(x || "").trim()).join("\n\n");
+    const r = await metaChat(input, skill.body);
+    const out = String(r.raw || "").trim();
+    if (!r.ok || !out) throw new Error("优化失败：" + String(r.err || "网关没有返回内容").slice(0, 300));
+    const saved = await pool.setNote({ id: item.id, note: out });
+    return { note: saved.note, via: r.via || "gateway" };
+  },
+  // 提示词 SKILL：文件在 docs/skills/*.md，可编辑、可 diff、可回滚。
+  "/api/skills": (b) => {
+    if (b && typeof b.name === "string" && typeof b.content === "string") {
+      const saved = skills.saveSkill(b.name, b.content);
+      return { skill: publicSkill(saved), preview: skillsPreview() };
+    }
+    return { skills: skills.listSkills(), preview: skillsPreview() };
+  },
+  "/api/skills/preview": (b) => {
+    const splitSkill = skills.loadSkill("split");
+    return {
+      prompt: skills.renderSplitPrompt(splitSkill, {
+        title: String(b.title || "示例任务标题"),
+        note: String(b.note || "示例任务本身（正文）"),
+        extra: String(b.extra || ""),
+      }),
+    };
+  },
+  "/api/skills/reset": (b) => {
+    const s = skills.resetSkill(String(b.name || ""));
+    return { skill: publicSkill(s), preview: skillsPreview() };
   },
   "/api/templates": (b) => {
     if (b && typeof b.splitSystem === "string") {
@@ -604,6 +941,8 @@ const ROUTES = {
     }
     return { templates: loadTemplates() };
   },
+  // 派单环境配置：只写非敏感字段；网关 key 永远不经过接口
+  "/api/config": (b) => saveConfig(b),
   "/api/maintenance/config": (b) => {
     const m = loadMaint();
     if (b && typeof b.threshold !== "undefined") m.threshold = Math.max(0, Number(b.threshold) || 0);
@@ -626,21 +965,21 @@ const ROUTES = {
     const job = await docsync.enqueueMaintenance({ note, docUrl });
     return { docsync: job };
   },
-  // 推入 = 两条线：任务本体立刻落库可开工；文档那一行进异步队列（docsync）。
-  // 接口不等任何一边：三项确认里授权打勾 → 后台自动派给工作 Agent；否则只等你去点「执行」。
+  // 推入 = 两条线：任务本体落库后立刻派单；文档那一行进异步队列（docsync）。
+  // 工作 Agent（Claude Code）的任务自动开工，WorkBuddy 的任务等 WB 取走。
   "/api/pool/push": async (b) => {
     const out = await pool.pushPool({ id: b.id, priority: b.priority });
-    const auth = !!(out.item.confirm && out.item.confirm.auth);
     const autoStarted = [];
     for (const t of out.created) {
-      if ((t.owner || "claude-code") !== "claude-code" || !auth) continue;
+      if ((t.owner || "claude-code") !== "claude-code") continue;
       // 兜底：池子里混进文档操作指令时不自动派给 Claude Code
       if (docsync.isDocSyncInstruction([t.subject, t.note].filter(Boolean).join("\n"))) continue;
       autoStarted.push(String(t.id));
       await dispatch.markStarting(t.id, "push");
       setImmediate(() => {
+        // 提示词只发「任务本身」：不拼优先级、文档簿记等额外内容
         dispatch
-          .runDispatch({ task: t.note || t.subject, mode: "read", repo: t.repo, taskId: t.id })
+          .runDispatch({ task: t.note, mode: "read", repo: t.repo, taskId: t.id, env: envOfTask(t) })
           .then(async (r) => {
             if (r && r.session_id) await dispatch.setTaskTask(t.id, { sessionId: r.session_id });
             syncBrain(t.id, t.subject, r);
@@ -657,7 +996,11 @@ const ROUTES = {
     const hours = Math.max(1, Number(b.hours || 24));
     const runs = purgeHistory(hours);
     const wsl = await purgeWslTmp(hours);
-    return { hours, runs, wsl, left: historyStats() };
+    // 运行态按环境清理：Windows 的 pid 在本地，WSL 的 runstate 只作为路径线索
+    const runstate = dispatch.pruneRunStates(hours * 3600 * 1000);
+    const jobFiles = jobs.prune(7);
+    const liveFiles = approvals.purgeLive(7);
+    return { hours, runs, wsl, runstate, jobs: jobFiles, live: liveFiles, left: historyStats() };
   },
   "/api/pool/remove": (b) => pool.removePool(b.id),
   // 终止只作用于「这张卡自己的会话」：前端带上 taskId，服务端按活进程反查 runId。
@@ -669,15 +1012,27 @@ const ROUTES = {
     if (!hit) return { stopped: false, note: "这条不在跑（可能已结束或换了会话）" };
     return dispatch.stopRun(hit.runId);
   },
-  // 删掉单条历史会话：WSL /tmp 产物 + runs 归档 + 台账行 + 任务上的会话指针
+  // 删掉单条历史会话：runstate（Windows 流/pid）+ WSL /tmp 产物 + runs 归档 + 台账行 + 会话指针
   "/api/run/delete": async (b) => {
     const id = String(b.id || "").trim();
     if (!/^[0-9]{8}-[0-9]{6}-[0-9A-Za-z]{6}$/.test(id)) throw new Error("run id 不合法: " + id);
-    const r = await runWsl(`bash ${scanScript()} delete ${id}`);
-    const out = String(r.out || "").trim();
-    if (out === "ALIVE") throw new Error("这条还在跑，先点「终止」再删");
-    if (out.startsWith("BADID")) throw new Error("run id 不合法");
-    const wslFiles = Number(out) || 0;
+    // 先看这条属于哪个环境：Windows 的产物在 data/runstate，别去 WSL 找
+    const st = dispatch.readRunState(id);
+    const env = st ? st.env : "";
+    let wslFiles = 0;
+    if (env !== "windows") {
+      const r = await runWsl(`bash ${scanScript()} delete ${id}`);
+      const out = String(r.out || "").trim();
+      if (out === "ALIVE") throw new Error("这条还在跑，先点「终止」再删");
+      if (out.startsWith("BADID")) throw new Error("run id 不合法");
+      wslFiles = Number(out) || 0;
+    }
+    let removedRunstate = false;
+    if (st) {
+      try { if (st.stream && existsSync(st.stream)) unlinkSync(st.stream); } catch { /* skip */ }
+      dispatch.removeRunState(id);
+      removedRunstate = true;
+    }
 
     // 台账：先取出这条的 session_id（用来清任务表），再把这一行删掉
     const ledgerFile = join(PATHS.dataDir, "claude-ledger.jsonl");
@@ -714,13 +1069,13 @@ const ROUTES = {
             const hitSession = session && String(t.sessionId || "") === session;
             // 这个任务已经没有别的派单记录了 → 指针一并不留（之后再跑就是新会话）
             const hitTask = b.taskId && String(t.id) === String(b.taskId) && !keepTasks.has(String(b.taskId));
-            if (hitSession || hitTask) { t.sessionId = ""; t.updatedAt = Date.now(); changed = true; clearedTasks += 1; }
+            if (hitSession || hitTask) { t.sessionId = ""; t.sessionEnv = ""; t.updatedAt = Date.now(); changed = true; clearedTasks += 1; }
           }
           return changed ? tasks : undefined;
         });
       } catch { /* skip */ }
     }
-    return { id, wslFiles, ledgerRemoved, removedRun, clearedTasks };
+    return { id, env, wslFiles, removedRunstate, ledgerRemoved, removedRun, clearedTasks };
   },
   // 投递型接口：只保证「已经开始」，不阻塞到子进程结束（一次派单最长 600 秒）。
   // 立刻返回 {started, taskId}，后台跑完再写回执 / sessionId / 台账。
@@ -730,16 +1085,19 @@ const ROUTES = {
     const name = String(b.name || "").trim();
     const path = String(b.path || "").trim();
     if (!name || !path) throw new Error("名字和路径都要填");
+    // env: auto（默认）/ wsl / windows；显式值只在「路径形态与运行环境不一致」时才用
+    const mode = String(b.env || "auto").trim().toLowerCase();
+    const env = mode === "wsl" || mode === "windows" ? mode : "auto";
     const list = loadProjects();
     if (list.some((x) => x.name === name)) throw new Error("同名项目已存在");
-    list.push({ id: "p" + Date.now().toString(36), name, path });
+    list.push({ id: "p" + Date.now().toString(36), name, path, env });
     saveProjects(list);
-    return { projects: list };
+    return { projects: list.map(publicProject), added: publicProject(list[list.length - 1]) };
   },
   "/api/projects/remove": (b) => {
     const list = loadProjects().filter((x) => x.id !== b.id);
     saveProjects(list);
-    return { projects: list };
+    return { projects: list.map(publicProject) };
   },
   "/api/task/nudge": async (b) => {
     const task = dispatch.getTask(b.id);
@@ -763,15 +1121,15 @@ const ROUTES = {
   },
   "/api/task/note": (b) => dispatch.setTaskTask(b.id, { note: String(b.note || "") }),
   // 人工验收：回执 ok 只说明 Claude 跑完了，不等于任务做对了。
-  // 人核对后在终端里「标记完成」，顺手标注类型（开发/review/Plan）与区域（代码区/文档区）。
+  // 工作类型在入池/推入时就定了，这里不再选；只补区域与证据。
   "/api/task/status": async (b) => {
     const task = dispatch.getTask(b.id);
     if (!task) throw new Error("没有这条任务");
     const status = String(b.status || "");
     if (status === "done") {
-      const workType = ["dev", "review", "plan"].includes(b.workType) ? b.workType : "dev";
+      const workType = pool.normWorkType(task.workType);
       const raw = b.area && typeof b.area === "object" ? b.area : {};
-      const kind = raw.kind === "docs" ? "docs" : "code";
+      const kind = raw.kind === "docs" ? "docs" : workType === "dev" ? "code" : "docs";
       // 代码区默认任务卡上的 repo；文档区必须由人指定路径
       const path = String(raw.path || "").trim() || (kind === "code" ? String(task.repo || "") : "");
       if (kind === "docs" && !path) throw new Error("文档区要指定路径");
@@ -795,31 +1153,44 @@ const ROUTES = {
     throw new Error("status 只能是 done 或 todo");
   },
   "/api/task/delete": (b) => dispatch.deleteTask(b.id),
+  // 任务行的工作类型：推入时已带上；taskboard 建的任务可在这里补/改。
+  "/api/task/worktype": async (b) => {
+    const t = await dispatch.setTaskTask(b.id, { workType: pool.normWorkType(b.workType) });
+    return { task: t, workType: t.workType };
+  },
   "/api/prompt/optimize": async (b) => {
     const text = (b.text || "").trim();
     if (!text) throw new Error("提示词为空");
-    // 「优化提示词 SKILL」里存的就是这段系统提示；以前存了没人读，改模板等于没改。
-    const systemText = String(loadTemplates().optimizeSystem || "").trim();
-    const prompt = [
-      systemText || "你是提示词优化助手。",
-      "把用户草稿改写成一条可直接交给 Claude Code 执行的派单指令，只用一段话，必须包含四要素：",
-      "1) 做什么；2) 照哪做（只给路径或文档名，不要贴全文）；3) 怎么验（具体命令）；4) 要什么回执。",
-      "保持原意、不要新增需求；信息不足时按仓库约定补全（AGENTS.md / docs/），不要反问用户。",
-      "只输出改写后的指令，不要解释、不要客套、不要 Markdown 代码块。",
-      "",
-      "草稿：",
-      text,
-    ].join("\n");
-    const r = await dispatch.runDispatch({ task: prompt, mode: "read", taskId: b.taskId });
+    // 工作类型决定用哪套优化提示词：开发 / 文档 / plan。类型在入池时就定好。
+    const task = b.taskId ? dispatch.getTask(b.taskId) : null;
+    const workType = pool.normWorkType(b.workType || (task && task.workType));
+    const skill = skills.loadSkill(`optimize-${workType}`);
+    const fallback = String(loadTemplates().optimizeSystem || "").trim();
+    const body = String((skill.error ? fallback : skill.body) || fallback).trim();
+    const prompt = skills.renderTextSkill({ body }, text);
+    // 元调用不需要仓库：优先直连网关，WSL 停着也能用
+    const m = await metaChat(prompt, body);
+    if (m.ok && String(m.raw || "").trim()) {
+      return { prompt: String(m.raw).trim(), status: "ok", cost: null, via: m.via || "gateway", workType };
+    }
+    // 网关不可用：退回 Claude Code 派单，把系统提示拼进正文
+    const fallbackTask = [body, "", prompt].filter(Boolean).join("\n");
+    const r = await dispatch.runDispatch({ task: fallbackTask, mode: "read", taskId: b.taskId });
     const out = String(r.result || "").trim();
     // 失败时别把原文当结果返回：前端会误报「已优化」，看起来就是点了没反应。
     if (!out) {
-      const why = r.error || r.stderr || `status=${r.status || "unknown"}`;
+      const why = r.error || r.stderr || m.err || `status=${r.status || "unknown"}`;
       throw new Error("优化失败：" + String(why).slice(0, 300));
     }
     return { prompt: out, status: r.status, cost: r.cost_usd };
   },
-  "/api/task/repo": (b) => dispatch.setTaskTask(b.id, { repo: b.repo }),
+  // 只改 repo 时 env 重置为 auto（按新路径重新判定）；也可显式指定 auto/wsl/windows
+  "/api/task/repo": async (b) => {
+    const mode = String(b.env || "auto").trim().toLowerCase();
+    const env = mode === "wsl" || mode === "windows" ? mode : "auto";
+    const t = await dispatch.setTaskTask(b.id, { repo: b.repo, env });
+    return { task: t, env: envOfTask(t) };
+  },
   "/api/task/docs": async (b) => {
     const prompt = [
       `任务：${b.title}`,
@@ -827,10 +1198,9 @@ const ROUTES = {
       "请输出严格 JSON（不要解释、不要代码块）：",
       '{"requirement":"需求描述（3-5句）","deliverables":["交付事项1","..."],"acceptance":["验收事项1","..."]}',
       "要求：验收事项必须是可逐条勾选验证的动作。",
-    ].filter(Boolean).join("\\n");
+    ].filter(Boolean).join("\n");
     const task = dispatch.getTask(b.id);
-    const r = await dispatch.runDispatch({ task: prompt, mode: "read", repo: task && task.repo, taskId: b.id });
-    return { dispatch: r, raw: r.result || "" };
+    return metaOrDispatch(prompt, { repo: task && task.repo, env: envOfTask(task || {}), taskId: b.id });
   },
   "/api/task/split": async (b) => {
     const prompt = [
@@ -838,22 +1208,21 @@ const ROUTES = {
       b.note ? `补充：${b.note}` : "",
       "输出严格 JSON 数组（不要解释）：",
       '[{"title":"子任务","owner":"claude-code 或 workbuddy"}]',
-    ].filter(Boolean).join("\\n");
+    ].filter(Boolean).join("\n");
     const task = dispatch.getTask(b.id);
-    const r = await dispatch.runDispatch({ task: prompt, mode: "read", repo: task && task.repo, taskId: b.id });
-    return { dispatch: r, raw: r.result || "" };
+    return metaOrDispatch(prompt, { repo: task && task.repo, env: envOfTask(task || {}), taskId: b.id });
   },
   "/api/task/optimize": async (b) => {
     const prompt = [
       "把下面这段任务说明改写成给 Claude Code 用的 SKILL.md（含 frontmatter name/description，正文写清四件套）。只输出 SKILL.md 全文。",
       `任务：${b.title}`,
       b.note ? `补充：${b.note}` : "",
-    ].filter(Boolean).join("\\n");
+    ].filter(Boolean).join("\n");
     const task = dispatch.getTask(b.id);
-    const r = await dispatch.runDispatch({ task: prompt, mode: "read", repo: task && task.repo, taskId: b.id });
-    return { dispatch: r, skill: r.result || "" };
+    const out = await metaOrDispatch(prompt, { repo: task && task.repo, env: envOfTask(task || {}), taskId: b.id });
+    return { dispatch: out.dispatch, skill: out.raw || "" };
   },
-  "/api/approve": (b) => approvals.approve({ id: b.id }),
+  "/api/approve": (b) => approvals.approve({ id: b.id, remember: !!b.remember }),
   "/api/reject": (b) => approvals.reject({ id: b.id }),
 };
 
@@ -891,6 +1260,25 @@ const server = createServer(async (req, res) => {
     return sendJson(res, 200, { templates: loadTemplates() });
   }
 
+  if (req.method === "GET" && url.pathname === "/api/config") {
+    return sendJson(res, 200, publicConfig());
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/skills") {
+    return sendJson(res, 200, { skills: skills.listSkills(), preview: skillsPreview() });
+  }
+
+  // 后台作业：拆分等长动作的终态查询。列表只给池子行做徽标，全文走 /api/job?id=
+  if (req.method === "GET" && url.pathname === "/api/job") {
+    const job = jobs.getJob(url.searchParams.get("id"));
+    if (!job) return sendJson(res, 404, { error: "没有这个作业" });
+    return sendJson(res, 200, job);
+  }
+  if (req.method === "GET" && url.pathname === "/api/jobs") {
+    const kind = url.searchParams.get("kind") || "";
+    return sendJson(res, 200, { jobs: jobs.listJobs({ kind }) });
+  }
+
   if (req.method === "GET" && url.pathname === "/api/docsync") {
     return sendJson(res, 200, docsync.summary());
   }
@@ -905,11 +1293,13 @@ const server = createServer(async (req, res) => {
     }
     if (!dispatchId) return sendJson(res, 200, { dispatch: null, lines: [], rounds: [], source: "missing" });
 
-    // v=2：轮 + 动作契约（6 号方案）。旧前端不带 v 仍走原来的平铺行。
+    // v=2：平铺日志契约（12 号方案）。旧前端不带 v 仍走原来的平铺行。
     if (url.searchParams.get("v") === "2") {
       const before = Number(url.searchParams.get("before") || 0) || 0;
+      const after = Number(url.searchParams.get("after") || 0) || 0;
+      const beforeSeq = Number(url.searchParams.get("beforeSeq") || 0) || 0;
       try {
-        const data = await events.readRunRounds(dispatchId, { before });
+        const data = await events.readRunRounds(dispatchId, { before, after, beforeSeq });
         return sendJson(res, 200, {
           ...data,
           dispatch: dispatchId,
@@ -978,7 +1368,8 @@ const server = createServer(async (req, res) => {
         id: row.id || "",
         at: row.at || "",
         status: row.status || "",
-        cost: Number(row.cost_usd || 0),
+        env: row.env || "wsl",
+        cost: row.cost_usd === null || row.cost_usd === undefined ? null : Number(row.cost_usd),
         turns: Number(row.turns || 0),
         session: row.session_id || "",
         result: String(row.result || "").slice(0, 4000),
@@ -1045,6 +1436,9 @@ const server = createServer(async (req, res) => {
 
 markLegacyDocTasks();
 dispatch.prunePending();
+dispatch.pruneRunStates();
+// 上次进程被强杀时留下的 running job：统一判失败，界面不装死
+jobs.reap();
 setInterval(checkAutoCleanup, 60000);
 checkAutoCleanup();
 

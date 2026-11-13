@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import SheetShell from "../components/SheetShell.vue";
 import {
-  WORK_TYPES,
   browseDocs,
   closeMark,
   markBusy,
@@ -11,24 +10,15 @@ import {
   markForm,
   markParent,
   pickAreaKind,
-  pickWorkType,
   submitMark,
 } from "../store/useMark";
-import { docsDefault, joinPath } from "../utils/format";
+import { docsDefault, joinPath, typeLabel } from "../utils/format";
 </script>
 
 <template>
   <SheetShell :title="`标记完成 · #${markFor?.id || ''} ${markFor?.subject || ''}`" @close="closeMark">
-    <div class="hint">这条会话干了什么（类型）</div>
-    <div class="seg">
-      <button
-        v-for="w in WORK_TYPES"
-        :key="w.value"
-        :class="{ on: markForm.workType === w.value }"
-        @click="pickWorkType(w.value)">
-        {{ w.label }}
-      </button>
-    </div>
+    <div class="hint">工作类型（入池时就定了）</div>
+    <div class="pmeta" style="margin-top:4px">类型：{{ typeLabel(markFor?.workType) }} · 需要改就去任务卡上改</div>
 
     <div class="hint" style="margin-top:22px">动的是哪块（区域）</div>
     <div class="seg">

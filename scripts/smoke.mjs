@@ -42,11 +42,39 @@ try {
   check("state 不再带 stage / dispatches", !("stage" in state) && !("dispatches" in state) && !("stages" in state));
   check("state.tasks[].run 不带回执全文", (state.tasks || []).every((t) => !t.run || !("result" in t.run)));
   check("state.docsync 存在", !!state.docsync, `pending=${state.docsync?.pending}`);
+  check("state.notify 存在", !!state.notify && typeof state.notify.enabled === "boolean", `ok=${state.notify?.ok} mode=${state.notify?.mode}`);
   check("state.terminals 存在", !!state.terminals, `count=${state.terminals?.count}`);
   check("state.history 存在", !!state.history, `runs=${state.history?.runs}`);
 
   const doc = await get("/api/docsync");
   check("GET /api/docsync", typeof doc.pending === "number");
+
+  // 后台作业契约（拆分）：列表在、未知 id 给 404，不让前端无限转圈
+  const jobList = await get("/api/jobs?kind=pool.suggest");
+  check("GET /api/jobs", Array.isArray(jobList.jobs), `${jobList.jobs?.length ?? "?"} 条`);
+  const noJob = await fetch(`${base}/api/job?id=nope`);
+  check("GET /api/job 未知 id → 404", noJob.status === 404, `HTTP ${noJob.status}`);
+
+  // 拆分链路（10 号方案）：SKILL 文件化 + 空子任务拒绝
+  const skills = await get("/api/skills");
+  const splitSkill = (skills.skills || []).find((x) => x.name === "split");
+  check(
+    "GET /api/skills 拆分 SKILL",
+    !!splitSkill && splitSkill.output === "json-array" && (splitSkill.fields || []).includes("note"),
+    (splitSkill?.fields || []).join(",")
+  );
+  const badSkill = await fetch(base + "/api/skills", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-dash": "1" },
+    body: JSON.stringify({ name: "split", content: "---\noutput: json-array\nfields: [title]\n---\n缺 name 的 frontmatter" }),
+  });
+  check("POST /api/skills 缺 fields → 400", badSkill.status === 400, `HTTP ${badSkill.status}`);
+  const badApply = await fetch(base + "/api/pool/apply", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-dash": "1" },
+    body: JSON.stringify({ id: "nope", subs: [] }),
+  });
+  check("POST /api/pool/apply 空 subs → 400", badApply.status === 400, `HTTP ${badApply.status}`);
 
   // 回执全文单独取（列表轻量化）
   const rawTask = (state.tasks || [])[0];
@@ -64,6 +92,19 @@ try {
       Array.isArray(v2.rounds) && typeof v2.totalRounds === "number" && !!v2.source,
       `source=${v2.source} rounds=${v2.totalRounds}`
     );
+    check(
+      "GET /api/task/raw?v=2 平铺日志契约",
+      Array.isArray(v2.lines) && typeof v2.lastSeq === "number" && typeof v2.hasEarlier === "boolean",
+      `lines=${v2.lines?.length} first=${v2.firstSeq} last=${v2.lastSeq}`
+    );
+    if (Array.isArray(v2.lines) && v2.lines.length) {
+      const after = await get(`/api/task/raw?id=${encodeURIComponent(runTask.id)}&v=2&after=${Number(v2.lastSeq) || 0}`);
+      check(
+        "GET /api/task/raw?v=2 after=lastSeq 不再重复",
+        Array.isArray(after.lines) && after.lines.every((l) => Number(l.seq) > Number(v2.lastSeq)),
+        `lines=${after.lines?.length}`
+      );
+    }
     const dl = await fetch(`${base}/api/task/stream?id=${encodeURIComponent(runTask.id)}`);
     check("GET /api/task/stream", [200, 404].includes(dl.status), `HTTP ${dl.status}`);
     try { await dl.body?.cancel(); } catch { /* ignore */ }

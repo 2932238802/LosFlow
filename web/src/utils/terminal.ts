@@ -1,6 +1,6 @@
 // 终端渲染规则 / 摘要 / 异常提示：纯函数，不碰 DOM、不发请求。
 // 6 号方案：后端给结构化「轮 + 动作」，这里负责「表达」——工具名 + 入参 → 中文动作。
-import type { TermAction, TermEnd, TermRound, TermStats } from "../types";
+import type { RawLine, TermAction, TermEnd, TermRound, TermStats } from "../types";
 
 export type ActionKind = "bash" | "read" | "write" | "edit" | "grep" | "glob" | "todo" | "web" | "task" | "other";
 
@@ -329,6 +329,155 @@ export function anomalies(
         streak = 0;
       }
     }
+  }
+  return out;
+}
+
+// ---- 平铺日志（12 号方案）：一条连续日志，不再按「轮」分组 ----
+//
+// 服务端 rawLine 产出 think / say / cmd / out / err / end / report；
+// out/err 通过 actionId 挂回对应的 cmd，避免同一段输出在日志里出现两次。
+export type LogRow = {
+  key: string;
+  seq: number;
+  kind: "think" | "say" | "cmd" | "out" | "err" | "end" | "report";
+  text: string;
+  tool?: string;
+  input?: Record<string, any>;
+  ok?: boolean;
+  out?: string;
+  at?: string;
+  actionId?: string;
+  msgId?: string;
+};
+
+export function buildLogRows(lines: RawLine[]): LogRow[] {
+  const rows: LogRow[] = [];
+  const cmdByAction = new Map<string, LogRow>();
+  for (const l of lines || []) {
+    const seq = Number(l.seq || 0);
+    const key = `s${seq}`;
+    if (l.kind === "cmd") {
+      const row: LogRow = {
+        key,
+        seq,
+        kind: "cmd",
+        text: String(l.text || ""),
+        tool: String(l.tool || ""),
+        input: l.input || {},
+        ok: true,
+        out: "",
+        at: l.at || "",
+        actionId: l.actionId || "",
+        msgId: l.msgId || "",
+      };
+      rows.push(row);
+      if (row.actionId) cmdByAction.set(row.actionId, row);
+      continue;
+    }
+    if (l.kind === "out" || l.kind === "err") {
+      const hit = l.actionId ? cmdByAction.get(String(l.actionId)) : null;
+      if (hit) {
+        hit.out = [hit.out, String(l.text || "")].filter(Boolean).join("\n");
+        if (l.kind === "err" || l.ok === false) hit.ok = false;
+        continue;
+      }
+      rows.push({
+        key,
+        seq,
+        kind: l.kind,
+        text: String(l.text || ""),
+        ok: l.kind !== "err",
+        at: l.at || "",
+        actionId: l.actionId || "",
+      });
+      continue;
+    }
+    if (l.kind !== "think" && l.kind !== "say" && l.kind !== "end" && l.kind !== "report") continue;
+    const prev = rows[rows.length - 1];
+    // 同一条消息的连续思考 / 连续发言合并成一行，减少碎片
+    if (prev && prev.kind === l.kind && (l.kind === "think" || l.kind === "say") && prev.msgId && prev.msgId === (l.msgId || "")) {
+      prev.text = [prev.text, String(l.text || "")].filter(Boolean).join("\n\n");
+      prev.seq = seq || prev.seq;
+      prev.key = `s${prev.seq}`;
+      continue;
+    }
+    rows.push({
+      key,
+      seq,
+      kind: l.kind,
+      text: String(l.text || ""),
+      at: l.at || "",
+      msgId: l.msgId || "",
+    });
+  }
+  return rows;
+}
+
+export function logStats(rows: LogRow[]): { actions: number; errors: number; files: string[] } {
+  const files = new Set<string>();
+  let actions = 0;
+  let errors = 0;
+  for (const r of rows) {
+    if (r.kind === "cmd") {
+      actions += 1;
+      if (r.ok === false) errors += 1;
+      if (["Edit", "MultiEdit", "Write", "NotebookEdit"].includes(r.tool || "")) {
+        const p = r.input && (r.input.file_path || r.input.notebook_path || r.input.path);
+        if (p) files.add(String(p));
+      }
+    } else if (r.kind === "err") {
+      errors += 1;
+    }
+  }
+  return { actions, errors, files: [...files] };
+}
+
+export function rowMatches(r: LogRow, q: string): boolean {
+  const needle = String(q || "").trim().toLowerCase();
+  if (!needle) return true;
+  let input = "";
+  try { input = JSON.stringify(r.input || {}); } catch { input = ""; }
+  return [r.text, r.out, r.tool, input].filter(Boolean).join("\n").toLowerCase().includes(needle);
+}
+
+export function rowChanged(r: LogRow): boolean {
+  return r.kind === "cmd" && isChangedTool(r.tool || "", r.input);
+}
+
+export function rowAction(r: LogRow): TermAction {
+  return {
+    id: r.actionId || r.key,
+    tool: r.tool || "",
+    input: r.input || {},
+    ok: r.ok !== false,
+    out: r.out || "",
+    err: r.ok === false ? r.out || "" : null,
+    at: r.at || "",
+  };
+}
+
+export function logText(rows: LogRow[]): string {
+  return rows
+    .map((r) => {
+      if (r.kind === "cmd") return [r.text, r.out].filter(Boolean).join("\n");
+      if (r.kind === "out" || r.kind === "err") return r.text;
+      if (r.kind === "think") return "思考：" + r.text;
+      return r.text;
+    })
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+export function logAnomalies(
+  rows: LogRow[],
+  opts: { running: boolean; lastEventAt: number; now: number }
+): { text: string }[] {
+  const out: { text: string }[] = [];
+  const errors = rows.filter((r) => r.kind === "err" || (r.kind === "cmd" && r.ok === false)).length;
+  if (errors) out.push({ text: `${errors} 条错误` });
+  if (opts.running && opts.lastEventAt && opts.now - opts.lastEventAt > 120000) {
+    out.push({ text: `${Math.floor((opts.now - opts.lastEventAt) / 60000)} 分钟无输出` });
   }
   return out;
 }

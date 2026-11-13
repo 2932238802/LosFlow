@@ -1,14 +1,16 @@
 import { computed, reactive, ref, watch } from "vue";
 import { post } from "../api";
-import type { Task } from "../types";
+import type { Approval, Task, WorkType } from "../types";
 import { busy, refresh, s } from "./useAppState";
 import { askConfirm } from "./useConfirm";
 import { focusNew } from "./useFocus";
 import { openRepo } from "./useProjects";
 import { newTitle } from "./usePool";
 import { flash } from "./useToast";
+import { startProgress, stopProgress } from "./useProgress";
 import { isRunning } from "./useTerminal";
 import { view } from "./useView";
+import { typeLabel } from "../utils/format";
 
 // 列表（docOnly = 纯文档同步活，不占任务页）
 export const openTasks = computed(() => (s.value?.tasks || []).filter((t) => t.status !== "done" && !t.docOnly));
@@ -108,17 +110,35 @@ export async function dispatchTask(t: Task, cont = false) {
   }
   busy.value = t.id;
   try {
-    await post(cont ? "/api/task/continue" : "/api/task/dispatch", {
+    const r = await post(cont ? "/api/task/continue" : "/api/task/dispatch", {
       id: t.id,
       task: drafts[t.id] || t.note || t.subject,
     });
-    flash("已投递，正在接管…");
+    if (r?.newSession) flash(`环境已变，已新开${r.env === "windows" ? "Windows" : "WSL2"}会话（旧会话不能跨环境续接）`);
+    else flash("已投递，正在接管…");
     await refresh(); // 立刻拿到 starting/running
     fastPoll(t.id);
   } catch (e: any) {
     flash(e.message, true);
   }
   busy.value = "";
+}
+
+// 漏批后的「接着跑」：复用续接链路（有 sessionId 走 /api/task/continue），
+// 不重派新会话；确认一次，避免误点重复花钱。
+export async function resumeTask(t: Task) {
+  if (isRunning(t.id) || t.starting) {
+    flash("这条还在跑，等它结束再说", true);
+    return;
+  }
+  const ok = await askConfirm({
+    title: `接着跑 #${t.id}？`,
+    body: t.subject,
+    detail: "会续接上一次会话，Claude 记得前面的上下文；会按原任务再产生一次派单花费。",
+    okText: "接着跑",
+  });
+  if (!ok) return;
+  await dispatchTask(t, true);
 }
 
 export async function stopRun(t: Task) {
@@ -176,6 +196,18 @@ export function setRepo(t: Task) {
   openRepo(t);
 }
 
+// 工作类型在入池时就定；taskboard 建的任务（或旧数据）可以在这里补/改。
+// 改完「优化提示词」会按新类型选 SKILL，标记完成时也沿用它。
+export async function setTaskWorkType(t: Task, workType: WorkType) {
+  try {
+    await post("/api/task/worktype", { id: t.id, workType });
+    flash(`#${t.id} 工作类型改为 ${typeLabel(workType)}`);
+    await refresh();
+  } catch (e: any) {
+    flash(e.message, true);
+  }
+}
+
 export async function optimizePrompt(t: Task) {
   busy.value = t.id;
   const text = (drafts[t.id] ?? "").trim();
@@ -183,22 +215,26 @@ export async function optimizePrompt(t: Task) {
     busy.value = "";
     return flash("先写点东西再优化", true);
   }
+  startProgress("正在优化提示词");
   flash("优化中…");
   try {
-    const r = await post("/api/prompt/optimize", { text, taskId: t.id });
+    const r = await post("/api/prompt/optimize", { text, taskId: t.id, workType: t.workType });
     if (!r.prompt) throw new Error("没有拿到优化结果，稍后重试");
     drafts[t.id] = r.prompt;
     optInfo.value = { ...optInfo.value, [t.id]: { cost: r.cost, at: new Date().toTimeString().slice(0, 5) } };
     flash("已优化，确认后再推送");
   } catch (e: any) {
     flash(e.message, true);
+  } finally {
+    busy.value = "";
+    stopProgress();
   }
-  busy.value = "";
   refresh();
 }
 
 export async function genDocs(t: Task) {
   busy.value = t.id;
+  startProgress("正在生成需求 / 交付 / 验收");
   flash("生成需求/交付/验收…");
   try {
     const r = await post("/api/task/docs", { id: t.id, title: t.subject, note: t.note || "" });
@@ -206,13 +242,16 @@ export async function genDocs(t: Task) {
     sheet.value = { title: `${t.subject} · 需求文档`, body: r.raw || "", json: m ? JSON.parse(m[0]) : null };
   } catch (e: any) {
     flash(e.message, true);
+  } finally {
+    busy.value = "";
+    stopProgress();
   }
-  busy.value = "";
   refresh();
 }
 
 export async function splitTask(t: Task) {
   busy.value = t.id;
+  startProgress("正在拆分任务");
   flash("智能拆分…");
   try {
     const r = await post("/api/task/split", { id: t.id, title: t.subject, note: t.note || "" });
@@ -220,8 +259,10 @@ export async function splitTask(t: Task) {
     sheet.value = { title: `${t.subject} · 拆分建议`, body: r.raw || "", json: m ? JSON.parse(m[0]) : null };
   } catch (e: any) {
     flash(e.message, true);
+  } finally {
+    busy.value = "";
+    stopProgress();
   }
-  busy.value = "";
   refresh();
 }
 
@@ -255,22 +296,49 @@ export async function cleanup() {
   }
 }
 
-export async function approve(id: string) {
+export async function approve(id: string, remember = false) {
   try {
-    await post("/api/approve", { id });
-    flash("已批准");
+    const r = await post("/api/approve", { id, remember });
+    if (r?.live) flash(remember ? "已放行并记住规则，同一次运行继续" : "已放行，同一次运行继续执行");
+    else flash(r?.retry?.note || "已批准（按原任务重派一次）");
     refresh();
   } catch (e: any) {
     flash(e.message, true);
+    refresh();
   }
 }
 export async function reject(id: string) {
   try {
-    await post("/api/reject", { id });
-    flash("已拒绝");
+    const r = await post("/api/reject", { id });
+    flash(r?.live ? "已拒绝，同一次运行会收到拒绝理由继续" : "已拒绝");
     refresh();
   } catch (e: any) {
     flash(e.message, true);
+    refresh();
   }
+}
+
+// live 卡片上的「终止这次运行」：按 taskId 走现有终止链路，只杀这张卡自己的会话。
+export async function stopApprovalRun(a: Approval) {
+  const taskId = String(a.taskId || "");
+  if (!taskId) {
+    flash("这条请求没有任务 id；去终端页按 runId 终止", true);
+    return;
+  }
+  const ok = await askConfirm({
+    title: `终止 #${taskId}？`,
+    body: a.cmd ? a.cmd.slice(0, 200) : "这次会话会立即停止",
+    detail: "只杀这张卡自己的 Claude Code 会话；已产生的花费不退。",
+    okText: "终止",
+    danger: true,
+  });
+  if (!ok) return;
+  try {
+    const r = await post("/api/run/stop", { taskId });
+    flash(r.note || "已终止");
+  } catch (e: any) {
+    flash(e.message, true);
+  }
+  refresh();
 }
 

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import type { Task } from "../types";
-import { docText, pct, stageInfo, waitedFor } from "../utils/format";
+import { docText, envLabel, normWorkType, pct, stageInfo, typeLabel, waitedFor, WORK_TYPES } from "../utils/format";
 import { busy, nowMs } from "../store/useAppState";
 import {
   delTask,
@@ -14,6 +14,7 @@ import {
   optimizePrompt,
   setDraft,
   setRepo,
+  setTaskWorkType,
   stopRun,
   toggleOpen,
 } from "../store/useTasks";
@@ -29,6 +30,10 @@ const stage = computed(() => stageInfo(props.task, isRunning(props.task.id)));
       <span class="caret" :class="{ on: open === task.id }">›</span>
       <span class="title">#{{ task.id }} {{ task.subject }}</span>
       <span class="badge">{{ task.owner === "workbuddy" ? "WB" : "CC" }}</span>
+      <span class="badge" :title="'工作类型：入池时就定，优化提示词 / 标记完成都沿用它'">{{ typeLabel(task.workType) }}</span>
+      <span v-if="task.owner !== 'workbuddy'" class="badge" :title="task.envMode === 'auto' ? '按工作目录自动判定' : '项目显式指定'">
+        {{ envLabel(task.env) }}
+      </span>
       <span class="sp"></span>
       <span v-if="isRunning(task.id)" class="badge live">{{ runningElapsed }}s</span>
     </div>
@@ -42,20 +47,39 @@ const stage = computed(() => stageInfo(props.task, isRunning(props.task.id)));
 
     <div v-if="open === task.id" class="detail">
       <div class="pmeta" style="margin-bottom:10px">
-        {{ task.repo || "~/LosAngelous/Vesta" }}
-        <span v-if="task.sessionId"> · 会话 {{ task.sessionId.slice(0, 8) }}</span>
+        {{ task.repo || (task.env === "windows" ? "（未指定目录）" : "~/LosAngelous/Vesta") }}
+        <span v-if="task.sessionId"> · 会话 {{ task.sessionId.slice(0, 8) }}
+          <template v-if="task.sessionEnv"> · {{ envLabel(task.sessionEnv) }}</template>
+        </span>
         <span v-else> · 尚未开会话</span>
         <a class="lnk" @click="setRepo(task)">改目录</a>
+      </div>
+      <div v-if="task.lastError" class="pmeta" style="margin-bottom:10px; color:#e08a8a">
+        上次派单{{ task.lastErrorStatus === "preflight" ? "环境检查未通过，未产生花费" : "未成功（" + (task.lastErrorStatus || "error") + "）" }}：
+        {{ task.lastError }}
       </div>
       <!-- Claude Code 任务：提示词发给 CC -->
       <div v-if="task.owner !== 'workbuddy'" class="promptbox">
         <div class="hint">提示词 · 发给 <b>Claude Code</b></div>
+        <div class="row" style="margin:8px 0 10px; gap:10px">
+          <span class="pmeta">工作类型</span>
+          <div class="seg">
+            <button
+              v-for="w in WORK_TYPES"
+              :key="w.value"
+              :class="{ on: normWorkType(task.workType) === w.value }"
+              :disabled="task.status === 'done'"
+              @click="setTaskWorkType(task, w.value)">
+              {{ w.label }}
+            </button>
+          </div>
+        </div>
         <textarea
           :value="draftOf(task)"
           rows="3"
           @input="setDraft(task.id, ($event.target as HTMLTextAreaElement).value)"></textarea>
         <div class="acts">
-          <button class="act" :disabled="busy === task.id" @click="optimizePrompt(task)">优化提示词</button>
+          <button class="act" :disabled="busy === task.id" @click="optimizePrompt(task)">优化提示词（{{ typeLabel(task.workType) }}）</button>
           <button
             class="act"
             :disabled="busy === task.id || !!task.starting"

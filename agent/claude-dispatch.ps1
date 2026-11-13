@@ -1,9 +1,20 @@
 ﻿<#
 .SYNOPSIS
-    Dispatch one task to Claude Code inside WSL2 (start_claude_code_jz: one-api gateway +
-    deepseek-v4-flash), collect the receipt, append to a ledger. Built for cost control.
+    Dispatch one task to Claude Code in the environment its project belongs to:
+    WSL2 (start_claude_code_jz: one-api gateway + deepseek-v4-flash) or Windows
+    (local claude.exe). Collect the receipt, append to a ledger. Built for cost control.
 
 .DESCRIPTION
+    Two layers:
+      orchestrator (this file) -- dedupe / budget / resume / allowlist / approvals /
+        receipt parsing / ledger / running.json. Environment-agnostic.
+      runner (runners/run-wsl.ps1, runners/run-windows.ps1) -- execute only. They do
+        their own preflight and return { rc, jsonPath, errPath, streamPath, pid, env }.
+        A preflight failure writes NO ledger row, NO approval and NO running.json.
+
+    Environments never share CLI, config, sessions, processes or temp files. A WSL
+    session_id cannot be resumed on Windows and vice versa.
+
     Rules learned from live tests (2026-11-13):
       1. --allowedTools needs PREFIX wildcards: 'Bash(npm run typecheck:*)'. An exact entry
          fails because the model wraps commands as 'cmd 2>&1; echo "EXIT=$?"'.
@@ -36,7 +47,14 @@
     Read the task body from a UTF-8 file instead.
 
 .PARAMETER Repo
-    Repo directory inside WSL. Default: ~/LosAngelous/Vesta
+    Repo directory. Default depends on the resolved environment (see -Env):
+    wsl -> ~/LosAngelous/Vesta, windows -> must be provided.
+
+.PARAMETER Env
+    Execution environment: auto (default), wsl or windows. Resolved from Repo when auto;
+    an explicit value is authoritative but the runner still verifies the path exists there.
+    Windows dispatch uses the local Claude Code; WSL dispatch uses start_claude_code_jz.
+    The two never share CLI, config, sessions, processes or temp files.
 
 .PARAMETER Mode
     read (default) or write (adds Write/Edit and --permission-mode acceptEdits).
@@ -93,6 +111,8 @@ param(
     [int]$DedupeMinutes = 30,
     [switch]$Force,
     [switch]$DryRun,
+    [ValidateSet('auto', 'wsl', 'windows', '')]
+    [string]$Env = 'auto',
     [string]$Distro = '',
     [int]$TimeoutSec = 600,
     [string]$OutDir = '',
@@ -100,7 +120,9 @@ param(
     [string]$TaskId = '',
     [switch]$Stream,
     [switch]$JsonOut,
-    [switch]$NoApproval
+    [switch]$NoApproval,
+    [switch]$NoLiveApprove,
+    [int]$ApprovalTimeoutSec = 0
 )
 
 # ---------- paths ----------
@@ -110,7 +132,28 @@ param(
 $cfg = Get-DsPaths
 if (-not $OutDir) { $OutDir = $cfg.progressDir }
 if (-not $Distro) { $Distro = $cfg.wslDistro }
-if (-not $Repo) { $Repo = $cfg.wslRepo }
+if (-not $PSBoundParameters.ContainsKey('TimeoutSec')) { $TimeoutSec = [int]$cfg.claudeTimeoutSec }
+
+# Live approval: --permission-prompt-tool -> agent/approval-mcp.py.
+# Default on; losflow.config.json { "liveApprove": false } or -NoLiveApprove falls back to
+# "run first, ask afterwards" (legacy approvals + retry).
+$liveApprove = $true
+if ($cfg.PSObject.Properties.Name -contains 'liveApprove' -and $cfg.liveApprove -eq $false) { $liveApprove = $false }
+if ($NoLiveApprove) { $liveApprove = $false }
+if ($ApprovalTimeoutSec -le 0) {
+    $ApprovalTimeoutSec = 50
+    if ($cfg.PSObject.Properties.Name -contains 'approvalTimeoutSec' -and [int]$cfg.approvalTimeoutSec -gt 0) {
+        $ApprovalTimeoutSec = [int]$cfg.approvalTimeoutSec
+    }
+}
+$ApprovalTimeoutSec = [Math]::Max(5, [Math]::Min(55, $ApprovalTimeoutSec))
+
+# Execution environment is a first-class field: resolve once here, then hand it to the runner.
+# Rule is duplicated in server/env.mjs (must stay identical).
+$defaultEnv = 'wsl'
+if ($cfg.defaultEnv) { $defaultEnv = [string]$cfg.defaultEnv }
+$Env = Resolve-DsEnv -Path $Repo -Explicit $Env -DefaultEnv $defaultEnv
+if (-not $Repo -and $Env -eq 'wsl') { $Repo = [string]$cfg.wslRepo }
 
 # ---------- UTF-8 stdout ----------
 # Without this, the same script writes GBK when launched from a service/console-less parent
@@ -164,13 +207,54 @@ function Remove-Running {
     try { if (Test-Path $runningFile) { Remove-Item $runningFile -Force } } catch { }
 }
 
+$id = (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + ([guid]::NewGuid().ToString('N').Substring(0, 6))
+
+# Preflight failure: nothing was spent, so write NO ledger row, NO approval, NO running.json.
+# The receipt still has the same shape so the dashboard / caller can show the reason.
+function Write-Preflight([string]$msg) {
+    Write-Host ("PREFLIGHT: {0}" -f $msg) -ForegroundColor Red
+    $out = [pscustomobject]@{
+        id              = $id
+        status          = 'preflight'
+        rc              = 90
+        env             = $Env
+        session_id      = ''
+        resumed         = $false
+        is_error        = $false
+        turns           = $null
+        duration_s      = 0
+        cost_usd        = $null
+        input_tok       = $null
+        cache_read      = $null
+        denials         = ''
+        suggested_allow = ''
+        result          = ''
+        json            = ''
+        ledger          = $ledger
+        elapsed_s       = 0
+        today_spend     = [math]::Round($todaySpend, 4)
+        error           = $msg
+        stderr          = ''
+        preflight       = $true
+    }
+    if ($JsonOut) { Write-Output (ConvertTo-Json -Compress -Depth 4 -InputObject $out) } else { $out }
+}
+
 $rows = Get-LedgerRows
 $today = (Get-Date).ToString('yyyy-MM-dd')
 $todayRows = @($rows | Where-Object { $_.at -and $_.at.StartsWith($today) })
 $todaySpend = 0.0
 foreach ($r in $todayRows) { if ($r.cost_usd) { $todaySpend += [double]$r.cost_usd } }
 
-$taskHash = Get-TaskHash ("$Repo|$Mode|$Allow|$Task")
+# Windows dispatch always needs an explicit repo: there is no sensible default directory.
+if ($Env -eq 'windows' -and -not $Repo) {
+    Write-Preflight 'env=windows requires -Repo (no default Windows working directory)'
+    return
+}
+
+# env is part of the hash: the same sentence in a WSL project and a Windows project are
+# two different jobs and must not dedupe each other.
+$taskHash = Get-TaskHash ("$Env|$Repo|$Mode|$Allow|$Task")
 
 # ---------- dedupe ----------
 if ($DedupeMinutes -gt 0 -and -not $Force) {
@@ -185,6 +269,7 @@ if ($DedupeMinutes -gt 0 -and -not $Force) {
             id              = $prev[0].id
             status          = 'deduped'
             rc              = 0
+            env             = $Env
             session_id      = $prev[0].session_id
             resumed         = $false
             is_error        = $false
@@ -202,6 +287,7 @@ if ($DedupeMinutes -gt 0 -and -not $Force) {
             today_spend     = [math]::Round($todaySpend, 4)
             error           = $null
             stderr          = ''
+            preflight       = $false
         }
         if ($JsonOut) { Write-Output (ConvertTo-Json -Compress -Depth 4 -InputObject $deduped) } else { $deduped }
         return
@@ -214,19 +300,30 @@ if (-not $Force -and $todaySpend -ge $MaxCostUsd) {
 }
 
 # ---------- resume resolution ----------
+# Sessions do not cross environments: a WSL session_id cannot be resumed on Windows and
+# vice versa. Old ledger rows have no env field -> they are wsl.
 if (-not $Resume -and $Continue) {
-    $last = @($rows | Where-Object { $_.repo -eq $Repo -and $_.session_id } | Select-Object -Last 1)
-    if ($last.Count -gt 0) { $Resume = [string]$last[0].session_id }
-    else { Write-Host 'NOTE: -Continue found no earlier session for this repo; starting a new one.' -ForegroundColor Yellow }
+    $last = @($rows | Where-Object {
+            $_.repo -eq $Repo -and $_.session_id -and
+            (($_.env -eq $Env) -or (-not $_.env -and $Env -eq 'wsl'))
+        } | Select-Object -Last 1)
+    if ($last.Count -gt 0) {
+        $Resume = [string]$last[0].session_id
+    } else {
+        $other = @($rows | Where-Object { $_.repo -eq $Repo -and $_.session_id -and $_.env -and $_.env -ne $Env } | Select-Object -Last 1)
+        if ($other.Count -gt 0) {
+            Write-Host ("NOTE: -Continue ignored: the last session for this repo belongs to env={0}, not env={1}. Start a new session." -f $other[0].env, $Env) -ForegroundColor Yellow
+        } else {
+            Write-Host 'NOTE: -Continue found no earlier session for this repo; starting a new one.' -ForegroundColor Yellow
+        }
+    }
 }
 
 # ---------- tool permissions ----------
 if ($Mode -eq 'write') {
     $allowed = 'Write Edit Read Grep Glob'
-    $permArg = '--permission-mode acceptEdits'
 } else {
     $allowed = 'Read Grep Glob'
-    $permArg = ''
 }
 if ($Allow) { $allowed = ($allowed + ' ' + $Allow).Trim() }
 
@@ -236,100 +333,52 @@ if ($allowRules.Count -gt 0) {
     $allowed = ($allowed + ' ' + ($allowRules -join ' ')).Trim()
 }
 
-# ---------- ids and paths ----------
-$id = (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + ([guid]::NewGuid().ToString('N').Substring(0, 6))
-$shWsl = "/tmp/cc-$id.sh"
-$outWsl = "/tmp/cc-$id.json"
-$errWsl = "/tmp/cc-$id.err"
-$streamWsl = "/tmp/cc-$id.stream.jsonl"
-
-# ---------- build the bash script ----------
-# The task body goes into a bash single-quoted string; only ' needs escaping.
-$taskEsc = $Task.Replace("'", "'\''")
-# ~ is not expanded inside quotes: swap the leading ~/ for $HOME/ and use double quotes.
-$repoBash = $Repo
-if ($repoBash.StartsWith('~/')) { $repoBash = '$HOME/' + $repoBash.Substring(2) }
-$repoEsc = $repoBash.Replace('"', '\"')
-$allowEsc = $allowed.Replace("'", "'\''")
-$resumeArg = ''
-if ($Resume) { $resumeArg = "--resume '$($Resume.Replace("'", "'\''"))'" }
-$modelArg = ''
-if ($Model) { $modelArg = "--model '$($Model.Replace("'", "'\''"))'" }
-$mcpArg = ''
-if (-not $Mcp) { $mcpArg = '--strict-mcp-config' }
-
-# per-call spend cap passed through to claude itself
-$budgetArg = ''
-if ($MaxBudget -gt 0) { $budgetArg = "--max-budget-usd $MaxBudget" }
-
-if ($Stream) {
-    $fmtArg = '--output-format stream-json --verbose'
-    $target = $streamWsl
-} else {
-    $fmtArg = '--output-format json'
-    $target = $outWsl
-}
-
-$lines = @(
-    '#!/bin/bash',
-    "cd `"$repoEsc`" || { echo 'REPO_NOT_FOUND' >&2; exit 90; }",
-    ('timeout {0} start_claude_code_jz -p ''{1}'' --allowedTools ''{2}'' {3} {4} {5} {6} {9} {10} > {7} 2> {8} &' -f `
-        $TimeoutSec, $taskEsc, $allowEsc, $permArg, $resumeArg, $modelArg, $mcpArg, $target, $errWsl, $fmtArg, $budgetArg),
-    'pid=$!',
-    ('echo $pid > /tmp/cc-{0}.pid' -f $id),
-    'wait $pid',
-    'rc=$?',
-    'echo "RC=$rc"'
-)
-$shText = ($lines -join "`n") + "`n"
-
+# ---------- plan / dry run ----------
 if ($DryRun) {
     Write-Host '--- plan ---' -ForegroundColor Cyan
+    Write-Host ("env       : {0}" -f $Env)
     Write-Host ("repo      : {0}" -f $Repo)
     Write-Host ("mode      : {0}   tools: {1}" -f $Mode, $allowed)
     Write-Host ("resume    : {0}" -f ($(if ($Resume) { $Resume } else { '(new session)' })))
     Write-Host ("mcp       : {0}" -f ($(if ($Mcp) { 'kept' } else { 'skipped (--strict-mcp-config)' })))
+    Write-Host ("approve   : {0}   timeout: {1}s" -f ($(if ($liveApprove) { 'live (permission-prompt-tool)' } else { 'legacy (after run)' })), $ApprovalTimeoutSec)
     Write-Host ("stream    : {0}   jsonout: {1}" -f [bool]$Stream, [bool]$JsonOut)
+    Write-Host ("runner    : {0}" -f (Join-Path $PSScriptRoot ("runners\run-$Env.ps1")))
     Write-Host ("spent today: {0:C3} / cap {1:C3}" -f $todaySpend, $MaxCostUsd)
-    Write-Host '--- bash script ---' -ForegroundColor Cyan
-    Write-Host $shText
     return
 }
 
-$uncDir = "\\wsl.localhost\$Distro\tmp"
-if (-not (Test-Path $uncDir)) { throw "WSL share not reachable: $uncDir (wrong distro name?)" }
-[System.IO.File]::WriteAllText((Join-Path $uncDir "cc-$id.sh"), $shText, (New-Object System.Text.UTF8Encoding($false)))
+# ---------- run (execution layer) ----------
+# Orchestration above stays environment-agnostic; runners only execute and return paths/pid.
+# They perform their own preflight and write running.json + runstate only after it passes.
+$runner = Join-Path $PSScriptRoot ("runners\run-$Env.ps1")
+if (-not (Test-Path $runner)) {
+    Write-Preflight ("runner missing for env={0}: {1}" -f $Env, $runner)
+    return
+}
 
-# running.json: the dashboard reads this to show "which task is running right now"
-try {
-    Write-JsonFile $runningFile ([ordered]@{
-            id        = $id
-            taskId    = $TaskId
-            status    = 'running'
-            startedAt = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
-            task      = $Task.Substring(0, [Math]::Min(160, $Task.Length))
-            stream    = $streamWsl
-        })
-} catch { }
-
-# ---------- run ----------
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
-$prevEap = $ErrorActionPreference
-$ErrorActionPreference = 'SilentlyContinue'
-$runOut = & wsl.exe -d $Distro -- bash $shWsl 2>&1 | Out-String
-$ErrorActionPreference = $prevEap
+$run = & $runner -Id $id -Task $Task -TaskFile $TaskFile -Repo $Repo -Mode $Mode -Allow $allowed `
+    -Resume $Resume -Model $Model -Mcp:$Mcp -TimeoutSec $TimeoutSec -MaxBudget $MaxBudget `
+    -Stream:$Stream -OutDir $OutDir -Distro $Distro -TaskId $TaskId -Config $cfg `
+    -LiveApprove:$liveApprove -ApprovalTimeoutSec $ApprovalTimeoutSec
 $sw.Stop()
 
-$rc = $null
-if ($runOut -match 'RC=(\d+)') { $rc = [int]$Matches[1] }
+if (-not $run) {
+    Write-Preflight ("runner returned nothing (env={0})" -f $Env)
+    return
+}
+if ($run.preflightError) {
+    Remove-Running
+    Write-Preflight ([string]$run.preflightError)
+    return
+}
+
+$rc = $run.rc
 
 # ---------- parse receipt ----------
-if ($Stream) {
-    $jsonPath = Join-Path $uncDir "cc-$id.stream.jsonl"
-} else {
-    $jsonPath = Join-Path $uncDir "cc-$id.json"
-}
-$errPath = Join-Path $uncDir "cc-$id.err"
+$jsonPath = $run.jsonPath
+$errPath = $run.errPath
 $receipt = $null
 $parseErr = $null
 if (Test-Path $jsonPath) {
@@ -382,6 +431,7 @@ $entry = [ordered]@{
     at              = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
     task_id         = $TaskId
     task_hash       = $taskHash
+    env             = $Env
     repo            = $Repo
     mode            = $Mode
     resumed_from    = $Resume
@@ -391,6 +441,9 @@ $entry = [ordered]@{
     timeout_sec     = $TimeoutSec
     model           = $Model
     mcp             = [bool]$Mcp
+    claude_version  = $run.claudeVersion
+    stream          = $run.streamPath
+    billing         = if ($receipt -and $null -ne $receipt.total_cost_usd) { 'gateway' } else { 'unknown' }
     is_error        = if ($receipt) { [bool]$receipt.is_error } else { $null }
     subtype         = if ($receipt) { $receipt.subtype } else { $null }
     turns           = if ($receipt) { $receipt.num_turns } else { $null }
@@ -431,6 +484,7 @@ if ($denials.Count -gt 0) {
             mode      = $Mode
             allow     = $Allow
             repo      = $Repo
+            env       = $Env
             status    = 'pending'
         }
         $list = @($list) + [pscustomobject]$rec
@@ -448,6 +502,7 @@ $out = [pscustomobject]@{
     id              = $id
     status          = $status
     rc              = $rc
+    env             = $Env
     session_id      = $sessionId
     resumed         = [bool]$Resume
     is_error        = $entry.is_error

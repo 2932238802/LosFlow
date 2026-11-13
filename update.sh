@@ -10,13 +10,16 @@
 #   任意一条不满足就报错退出，不再出现「看起来更新了其实没有」。
 #
 # 用法：
-#   ./update.sh                 # 构建 + 重启（默认）
+#   ./update.sh                 # 构建 + 检查 + 重启（默认）
 #   ./update.sh --no-build      # 只重启，不构建
+#   ./update.sh --no-check      # 跳过类型检查 / 单测 / 冒烟
+#   ./update.sh --check-only    # 只构建 + 检查，不重启服务
 #   ./update.sh --port 8900     # 指定端口（默认 LOSFLOW_PORT / losflow.config.json / 8899）
-#   ./update.sh --force         # 端口被非 server.mjs 进程占用时也强杀（默认拒绝）
+#   ./update.sh --force         # 端口被非 server.mjs 进程占用时也强杀；有任务在跑时也重启
 #   ./update.sh -h              # 帮助
 #
-# 注意：构建的是当前工作区代码，不会自动 git pull。
+# 检查使用隔离的数据目录，不会和正在跑的服务抢 data/；有任务在跑时默认
+# 拒绝重启（--force 跳过）。构建的是当前工作区代码，不会自动 git pull。
 set -u
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
@@ -24,23 +27,45 @@ cd "$ROOT" || { echo "✗ 进不去仓库目录"; exit 1; }
 
 PORT_ARG=""
 DO_BUILD=1
+DO_CHECK=1
+CHECK_ONLY=0
 FORCE=0
 
 die() { echo "✗ $*" >&2; exit 1; }
 info() { echo "→ $*"; }
+usage() {
+  cat <<'EOF'
+update.sh -- 重建前端 + 用本仓库的服务接管驾驶舱端口，并验证接管成功。
+
+用法：
+  ./update.sh                 构建 + 检查 + 重启（默认）
+  ./update.sh --no-build      只重启，不构建
+  ./update.sh --no-check      跳过类型检查 / 单测 / 冒烟
+  ./update.sh --check-only    只构建 + 检查，不重启服务
+  ./update.sh --port 8900     指定端口（默认 LOSFLOW_PORT / losflow.config.json / 8899）
+  ./update.sh --force         端口被非 server.mjs 进程占用时也强杀；有任务在跑时也重启
+  ./update.sh -h              帮助
+EOF
+}
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --no-build) DO_BUILD=0 ;;
+    --no-check) DO_CHECK=0 ;;
+    --check-only) CHECK_ONLY=1 ;;
     --port) shift; [ $# -gt 0 ] || die "--port 后面要跟端口号"; PORT_ARG="$1" ;;
     --force) FORCE=1 ;;
-    -h|--help) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) usage; exit 0 ;;
     *) die "不认识的参数：$1（用 --help 看用法）" ;;
   esac
   shift
 done
 
 command -v node >/dev/null 2>&1 || die "找不到 node（需要 Node >= 20）"
+NODE_VER="$(node -p 'process.versions.node')"
+NODE_MAJOR="${NODE_VER%%.*}"
+case "$NODE_MAJOR" in ''|*[!0-9]*) die "读不到 Node 版本：$NODE_VER" ;; esac
+[ "$NODE_MAJOR" -ge 20 ] || die "Node $NODE_VER 太旧（需要 >= 20）"
 
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*) PLATFORM=win ;;
@@ -109,7 +134,51 @@ EXPECT="$(grep -o 'assets/index-[^"]*\.js' web/dist/index.html | head -1 || true
 
 command -v curl >/dev/null 2>&1 || die "找不到 curl（健康检查需要）"
 
+# ---------- 1.5 重启保护：有任务在跑就不动服务（--force 可跳过） ----------
+live_state() { curl -s --max-time 3 "http://127.0.0.1:$PORT/api/state" 2>/dev/null || true; }
+assert_no_live_runs() {
+  [ "$FORCE" = 1 ] && return 0
+  ST="$(live_state)"
+  BUSY=""
+  if [ -n "$ST" ]; then
+    BUSY="$(printf '%s' "$ST" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const j=JSON.parse(d);let b=(j.tasks||[]).filter(t=>t.running||t.starting).map(t=>'#'+t.id);if(!b.length&&j.running&&j.running.taskId)b=['#'+j.running.taskId];if(b.length)process.stdout.write(b.join(' '))}catch(e){}})")"
+  fi
+  JOBS="$(curl -s --max-time 3 "http://127.0.0.1:$PORT/api/jobs?kind=pool.suggest" 2>/dev/null | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const j=JSON.parse(d);const r=(j.jobs||[]).filter(x=>x.status==='running').map(x=>'拆分 '+x.label);if(r.length)process.stdout.write(r.join(' '))}catch(e){}})" 2>/dev/null || true)"
+  [ -z "$JOBS" ] || BUSY="${BUSY:+$BUSY }$JOBS"
+  [ -z "$BUSY" ] || die "端口 $PORT 上还有活在跑（$BUSY）。等它跑完再更新；确认现在重启就加 --force。"
+}
+[ "$CHECK_ONLY" = 1 ] || assert_no_live_runs
+
+# ---------- 1.6 检查：类型 / 单测 / 冒烟（隔离数据目录，不碰正在跑的服务） ----------
+run_checks() {
+  [ "$DO_CHECK" = 1 ] || return 0
+  command -v npm >/dev/null 2>&1 || die "找不到 npm"
+  info "类型检查（npm run typecheck）"
+  npm run typecheck || die "类型检查失败，当前服务未动"
+  if [ "$NODE_MAJOR" -ge 24 ]; then
+    info "单元测试（npm test）"
+    npm test || die "单元测试失败，当前服务未动"
+  else
+    info "跳过 npm test（Node $NODE_VER；TS 测试需要 Node 24）"
+  fi
+  SMOKE_DATA="$(mktemp -d)"
+  SMOKE_PORT_NUM="$(node -e "const s=require('net').createServer();s.listen(0,'127.0.0.1',()=>{console.log(s.address().port);s.close()})")"
+  info "冒烟检查（隔离数据目录 + 临时端口 $SMOKE_PORT_NUM）"
+  RC=0
+  ( LOSFLOW_DATA="$SMOKE_DATA" LOSFLOW_TEMP="$SMOKE_DATA/tmp" LOSFLOW_STREAMS="$SMOKE_DATA/streams" LOSFLOW_RUNSTATE="$SMOKE_DATA/runstate" SMOKE_PORT="$SMOKE_PORT_NUM" npm run smoke ) || RC=$?
+  rm -rf "$SMOKE_DATA"
+  [ "$RC" -eq 0 ] || die "冒烟检查失败，当前服务未动"
+}
+run_checks
+
+if [ "$CHECK_ONLY" = 1 ]; then
+  echo "✓ 构建 / 检查通过（--check-only：没有重启服务）"
+  exit 0
+fi
+
 # ---------- 2. 找到端口占用者：是驾驶舱就停掉，不是就拒绝 ----------
+# 检查期间可能又有新任务开跑：落刀前再确认一次。
+assert_no_live_runs
 PIDS="$(find_pids || true)"
 if [ -n "$PIDS" ]; then
   for pid in $PIDS; do
@@ -141,8 +210,8 @@ fi
 # ---------- 3. 用本仓库的服务启动（用绝对路径，方便事后核对监听者是谁） ----------
 mkdir -p .tmp
 NODE_BIN="$(node -p "process.execPath")"
-out_log="$ROOT/.tmp/dashboard.out.log"
-err_log="$ROOT/.tmp/dashboard.err.log"
+out_log="$ROOT/.tmp/dashboard-$PORT.out.log"
+err_log="$ROOT/.tmp/dashboard-$PORT.err.log"
 if [ "$PLATFORM" = win ]; then
   SRV_JS="$(winpath "$ROOT/server/server.mjs")"
 else
@@ -181,7 +250,7 @@ case "$LISTEN_CMD" in
    可能被别的服务抢占了，或启动后立刻退出。看 $err_log"
     ;;
 esac
-echo "$START_PID" > .tmp/dashboard.pid
+echo "$START_PID" > ".tmp/dashboard-$PORT.pid"
 
 # ---------- 6. 校验：端口上响应的前端产物就是 web/dist 这一份 ----------
 ACTUAL="$(curl -s --max-time 5 "http://127.0.0.1:$PORT/app/" | grep -o 'assets/index-[^"]*\.js' | head -1 || true)"
@@ -202,5 +271,5 @@ if [ -n "$(git status --porcelain 2>/dev/null || true)" ]; then DIRTY="（工作
 echo "✓ 前端已构建：$EXPECT"
 echo "✓ 服务已接管：PID $START_PID · 端口 $PORT · 提交 $REV$DIRTY"
 echo "  驾驶舱：http://127.0.0.1:$PORT/app/"
-echo "  日志：  .tmp/dashboard.out.log / .tmp/dashboard.err.log"
+echo "  日志：  .tmp/dashboard-$PORT.out.log / .tmp/dashboard-$PORT.err.log"
 echo "  面板里如果还显示旧界面，刷新一下（Ctrl+F5）。"

@@ -1,6 +1,21 @@
 {
   "wslDistro": "Ubuntu-26.04",
   "wslRepo": "~/LosAngelous/Vesta",
+  "defaultEnv": "wsl",
+  "windowsClaudeCmd": "",
+  "windowsClaudeArgs": [],
+  "windowsClaudeEnv": {},
+  "claudeTimeoutSec": 600,
+  "liveApprove": true,
+  "approvalTimeoutSec": 50,
+  "notify": {
+    "enabled": true,
+    "mode": "auto",
+    "sound": true,
+    "minIntervalMs": 8000,
+    "repeatAfterMs": 20000
+  },
+  "pythonCmd": "",
   "nodeExe": "node",
   "dashboardPort": 8899
 }

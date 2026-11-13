@@ -110,7 +110,7 @@ export function enqueue({ taskId, subject, priority, status = "开发中", note 
 // action=update-row：WorkBuddy 在主表里按任务名找到那一行，只改状态与备注；
 // 找不到（推入时那行还没写进去）就按 append-row 追加，不会丢。
 export function enqueueBackfill({ taskId, subject, workType, area } = {}) {
-  const typeLabel = { dev: "开发", review: "review", plan: "Plan" }[workType] || String(workType || "开发");
+  const typeLabel = { dev: "开发", docs: "文档", plan: "Plan", review: "文档" }[workType] || "开发";
   const kind = area && area.kind === "docs" ? "文档区" : "代码区";
   const path = String((area && area.path) || "").trim();
   const payload = {

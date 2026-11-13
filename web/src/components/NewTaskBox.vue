@@ -2,9 +2,10 @@
 import { onBeforeUnmount, onMounted, ref } from "vue";
 import { busy } from "../store/useAppState";
 import { registerNewTaskFocus } from "../store/useFocus";
-import { add, newBody, newTitle, optimizeDraft, setNewBody, setNewTitle } from "../store/usePool";
+import { add, newBody, newTitle, newWorkType, optimizeDraft, setNewBody, setNewTitle, setNewWorkType } from "../store/usePool";
 import { currentProjectName, openPick, openProj } from "../store/useProjects";
 import { openTpl } from "../store/useSettings";
+import { WORK_TYPES } from "../utils/format";
 
 const inputEl = ref<HTMLInputElement | null>(null);
 onMounted(() =>
@@ -32,8 +33,18 @@ onBeforeUnmount(() => registerNewTaskFocus(null));
       rows="3"
       placeholder="写清：做什么 / 照哪份文档 / 怎么验 / 要什么回执"
       @input="setNewBody(($event.target as HTMLTextAreaElement).value)"></textarea>
+    <div class="hint" style="margin-top:12px">工作类型（入池时就定，优化提示词按它走）</div>
+    <div class="seg" style="margin-top:8px; width: fit-content">
+      <button
+        v-for="w in WORK_TYPES"
+        :key="w.value"
+        :class="{ on: newWorkType === w.value }"
+        @click="setNewWorkType(w.value)">
+        {{ w.label }}
+      </button>
+    </div>
     <div class="acts" style="margin-top:12px">
-      <button class="act" :disabled="busy === 'draft'" @click="optimizeDraft">优化提示词</button>
+      <button class="act" :disabled="busy === 'draft'" @click="optimizeDraft">优化提示词（{{ WORK_TYPES.find((w) => w.value === newWorkType)?.label }}）</button>
       <button class="act" @click="openTpl">优化提示词 SKILL</button>
     </div>
     <div class="add">

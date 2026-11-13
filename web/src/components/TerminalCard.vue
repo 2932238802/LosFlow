@@ -1,48 +1,67 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, reactive, ref, watch } from "vue";
 import { getJSON } from "../api";
-import type { Task, TermAction } from "../types";
-import { areaLabel, areaText, typeLabel } from "../utils/format";
-import { actionView, changePreview } from "../utils/terminal";
+import type { LogRow } from "../utils/terminal";
+import type { Task } from "../types";
+import { areaLabel, areaText, envLabel, fmtUsd, typeLabel } from "../utils/format";
+import { actionView, changePreview, rowAction } from "../utils/terminal";
+import { approvalForTask, needsResume, pendingOf, remainSeconds } from "../utils/approvals";
+import { nowMs, s } from "../store/useAppState";
 import { openMark, reopen } from "../store/useMark";
+import { resumeTask } from "../store/useTasks";
 import {
   anomaliesOf,
-  collapseAll,
   copyTerm,
   delRun,
-  expandAll,
   fullTerm,
   hist,
   isAtBottom,
-  isRoundOpen,
   isRunning,
-  loadRounds,
+  lineFilter,
+  lines,
+  loadHistory,
   onTermScroll,
   pendingNew,
-  roundFilter,
-  rounds,
-  runningElapsed,
   scrollBottom,
   search,
   setTermEl,
   startingOf,
   statsOf,
   toggleFull,
-  toggleRound,
-  toRound,
-  visibleRounds,
+  visibleRows,
 } from "../store/useTerminal";
+import ApprovalDock from "./ApprovalDock.vue";
 import HighlightText from "./HighlightText.vue";
 
 const props = defineProps<{ task: Task }>();
 const id = computed(() => props.task.id);
-const list = computed(() => visibleRounds(id.value));
+const his = computed(() => hist.value[id.value]);
 const stats = computed(() => statsOf(id.value));
 const fileCount = computed(() => stats.value.files.length);
-const his = computed(() => hist.value[id.value]);
+const rows = computed(() => visibleRows(id.value));
 const warns = computed(() => anomaliesOf(id.value));
+const pending = computed(() => pendingOf(s.value, id.value));
+const latest = computed(() => pending.value[0] || null);
+const resume = computed(() => needsResume(props.task, approvalForTask(s.value, id.value)));
+// 漏批后的灰条：请求过期/被拒、当前没有 pending、最近 30 分钟内，dock 位置留一条出路。
+const stale = computed(() => {
+  if (pending.value.length || isRunning(id.value)) return null;
+  const a = approvalForTask(s.value, id.value).find((x) => x.status === "expired" || x.status === "rejected");
+  if (!a) return null;
+  if (Date.now() - Number(a.atMs || 0) > 30 * 60 * 1000) return null;
+  return a;
+});
+const staleHidden = ref(false);
+watch(
+  () => [props.task.sessionId, pending.value.length],
+  () => {
+    if (!pending.value.length) staleHidden.value = false;
+  }
+);
 const fallbackResult = ref("");
 const actOpen = reactive<Record<string, boolean>>({});
+const foldOpen = reactive<Record<string, boolean>>({});
+const openAll = ref<boolean | null>(null);
 
 const FILTERS = [
   { key: "all", label: "全部" },
@@ -51,50 +70,55 @@ const FILTERS = [
   { key: "commands", label: "只看命令" },
 ] as const;
 
-function av(a: TermAction) {
-  return actionView(a);
+function av(r: LogRow) {
+  return actionView(rowAction(r));
 }
-function preview(a: TermAction) {
-  return changePreview(a);
+function preview(r: LogRow) {
+  return changePreview(rowAction(r));
 }
-function aOpen(a: TermAction) {
+function aOpen(r: LogRow): boolean {
   if (search.value.trim()) return true;
-  if (actOpen[a.id] !== undefined) return actOpen[a.id];
-  return av(a).defaultOpen;
+  if (openAll.value !== null) return openAll.value;
+  if (actOpen[r.key] !== undefined) return actOpen[r.key];
+  return r.kind === "cmd" && r.ok === false;
 }
-function toggleAct(a: TermAction) {
-  actOpen[a.id] = !aOpen(a);
+function toggleAct(r: LogRow) {
+  actOpen[r.key] = !aOpen(r);
 }
-function roundFiles(r: any): number {
-  const set = new Set<string>();
-  for (const a of r.actions || []) {
-    if (["Edit", "MultiEdit", "Write", "NotebookEdit"].includes(a.tool)) {
-      const p = a.input && (a.input.file_path || a.input.notebook_path || a.input.path);
-      if (p) set.add(String(p));
-    }
-  }
-  return set.size;
+function expandAll() {
+  openAll.value = true;
 }
-function isLastOf(r: any) {
-  return list.value.length > 0 && list.value[list.value.length - 1].msgId === r.msgId;
+function collapseAll() {
+  openAll.value = false;
 }
-// 最后一轮的 say 常常就是 end.result，别重复展示同一段
-function showSay(r: any): boolean {
-  if (!r.say) return false;
-  const end = his.value?.end?.result || "";
-  if (!end) return true;
-  const a = String(r.say).trim();
-  const b = String(end).trim();
-  return !(a === b || (a.length > 40 && b.startsWith(a.slice(0, 40))));
+function loadEarlier() {
+  const first = Number((lines.value[id.value] || [])[0]?.seq || 0);
+  if (first) loadHistory(id.value, { beforeSeq: first });
+}
+function remain(a: any) {
+  return remainSeconds(a, nowMs.value);
+}
+function needsFold(r: LogRow): boolean {
+  return r.text.length > 2000 || r.text.split("\n").length > 400;
+}
+function isFolded(r: LogRow): boolean {
+  // 搜索时自动展开，避免命中内容藏在折叠区里
+  return needsFold(r) && !foldOpen[r.key] && !search.value.trim();
+}
+function toggleFold(r: LogRow) {
+  foldOpen[r.key] = !foldOpen[r.key];
+}
+function foldText(r: LogRow): string {
+  return isFolded(r) ? r.text.slice(0, 2000) + "\n…" : r.text;
 }
 
 // 流已不在时，至少把台账里的回执全文拿出来
 watch(
-  () => [his.value?.source, his.value?.rounds?.length, props.task.run?.id],
+  () => [his.value?.source, (lines.value[id.value] || []).length, props.task.run?.id],
   async () => {
     fallbackResult.value = "";
     const h = his.value;
-    if (!h || h.source !== "missing" || rounds.value[id.value]?.length) return;
+    if (!h || h.source !== "missing" || (lines.value[id.value] || []).length) return;
     if (!props.task.run?.id) return;
     try {
       const j = await getJSON(`/api/task/run?id=${encodeURIComponent(id.value)}`);
@@ -109,7 +133,7 @@ watch(
 onBeforeUnmount(() => setTermEl(id.value, null));
 
 // 搜索 / 过滤变化后：跳到第一个命中，没有命中就回到顶部
-watch([search, roundFilter], () => {
+watch([search, lineFilter], () => {
   nextTick(() => {
     const el = document.getElementById(`term-body-${id.value}`);
     if (!el) return;
@@ -126,19 +150,28 @@ watch([search, roundFilter], () => {
       <span class="dot" :class="{ on: isRunning(id) }"></span>
       <b class="tid">#{{ task.id }}</b>
       <span class="tsub">{{ task.subject }}</span>
+      <span v-if="task.owner !== 'workbuddy'" class="badge">{{ envLabel(task.env) }}</span>
       <span class="sp"></span>
-      <span v-if="isRunning(id)" class="badge live">{{ runningElapsed }}s</span>
-      <span v-if="his?.end?.cost || task.run?.cost" class="tmeta">
-        {{ his?.end?.status || task.run?.status || "" }} · ${{ Number(his?.end?.cost ?? task.run?.cost ?? 0).toFixed(2) }}
+      <span v-if="isRunning(id)" class="badge live">{{ stats.durationMs ? Math.round(stats.durationMs / 1000) + "s" : "执行中" }}</span>
+      <span v-if="his?.end || task.run" class="tmeta">
+        {{ his?.end?.status || task.run?.status || "" }} · {{ fmtUsd(his?.end?.cost ?? task.run?.cost) }}
       </span>
       <span v-if="task.status === 'done'" class="done-badge" :title="areaText(task.area)">
         已完成<span v-if="task.workType"> · {{ typeLabel(task.workType) }} · {{ areaLabel(task.area) }}</span>
       </span>
       <button
+        v-if="resume"
+        class="iact resume"
+        :disabled="isRunning(id)"
+        title="上次会话没有干净结束（超时/被拒/失败）；点这里续接，不用回任务页"
+        @click.stop="resumeTask(task)">
+        接着跑
+      </button>
+      <button
         v-if="task.status !== 'done'"
         class="iact done"
         :disabled="isRunning(id)"
-        title="跑完并核对后，点这里标注类型与区域，任务才真正算完成"
+        title="跑完并核对后，点这里标注区域，任务才真正算完成"
         @click.stop="openMark(task)">
         标记完成
       </button>
@@ -150,73 +183,83 @@ watch([search, roundFilter], () => {
 
     <div class="term-meta">
       <span class="tstat" :class="{ bad: stats.errors > 0 }">
-        {{ his?.totalRounds ? `${his.totalRounds} 轮 · ` : "" }}{{ fileCount }} 文件 · {{ stats.actions }} 动作 · {{ stats.errors }} 错
+        {{ fileCount }} 文件 · {{ stats.actions }} 命令 · {{ stats.errors }} 错
       </span>
-      <span v-if="his?.source === 'missing' && !(rounds[id] || []).length" class="anom">原始流已不在（WSL /tmp 已清），只能看回执</span>
-      <button v-for="(w, i) in warns" :key="i" class="anom" @click="toRound(id, w.round)">{{ w.text }}</button>
+      <span v-if="his?.source === 'missing' && !(lines[id] || []).length" class="anom">原始流已不在（临时流已清理），只能看回执</span>
+      <span v-for="(w, i) in warns" :key="i" class="anom">{{ w.text }}</span>
       <span class="sp"></span>
       <a class="iact" :href="`/api/task/stream?id=${encodeURIComponent(id)}`" download>原始日志</a>
     </div>
 
     <div class="term-tools">
       <span class="chips">
-        <button v-for="f in FILTERS" :key="f.key" :class="{ on: roundFilter === f.key }" @click="roundFilter = f.key">{{ f.label }}</button>
+        <button v-for="f in FILTERS" :key="f.key" :class="{ on: lineFilter === f.key }" @click="lineFilter = f.key">{{ f.label }}</button>
       </span>
       <span class="sp"></span>
-      <button class="iact" @click="expandAll(id)">展开全部</button>
-      <button class="iact" @click="collapseAll(id)">收起全部</button>
-      <button v-if="his?.hasMore" class="iact" @click="loadRounds(id, list[0]?.i || 0)">加载更早</button>
+      <button class="iact" @click="expandAll">展开全部</button>
+      <button class="iact" @click="collapseAll">收起全部</button>
+      <button v-if="his?.hasMore" class="iact" @click="loadEarlier">加载更早</button>
     </div>
 
     <div :id="`term-body-${id}`" :ref="(el) => setTermEl(id, el)" class="term-body" @scroll="onTermScroll(id)">
-      <div v-if="!rounds[id]?.length" class="term-wait">
-        <template v-if="his?.source === 'missing'">
-          这次的流已不在（WSL /tmp 已清），只能看回执。<template v-if="fallbackResult"> 回执如下：</template>
+      <div v-if="!rows.length" class="term-wait">
+        <template v-if="(lines[id] || []).length">没有匹配的日志行（换个筛选或清空搜索）</template>
+        <template v-else-if="his?.source === 'missing'">
+          这次的流已不在（临时流已清理），只能看回执。<template v-if="fallbackResult"> 回执如下：</template>
         </template>
         <template v-else-if="startingOf(id)">已投递，等子进程接管…</template>
         <template v-else-if="isRunning(id)">会话已启动，等待第一条输出…</template>
         <template v-else>正在加载会话…</template>
       </div>
 
-      <div v-for="r in list" :id="`round-${id}-${r.i}`" :key="r.msgId || r.i" class="round" :class="{ err: r.status === 'error' }">
-        <div class="round-hd" @click="toggleRound(id, r.i, isRoundOpen(id, r, isLastOf(r)))">
-          <span class="rnum">第 {{ r.i }} 轮</span>
-          <span class="rmeta">{{ r.actions.length }} 动作<template v-if="roundFiles(r)"> · {{ roundFiles(r) }} 文件</template> · {{ r.at }}</span>
-          <span class="sp"></span>
-          <span v-if="r.status === 'error'" class="rerr">错误</span>
-          <span class="rcaret">{{ isRoundOpen(id, r, isLastOf(r)) ? "▾" : "▸" }}</span>
+      <div v-for="r in rows" :key="r.key" class="log-row" :class="{ err: (r.kind === 'err' || (r.kind === 'cmd' && r.ok === false)) }">
+        <div v-if="r.kind === 'think'" class="l-think">
+          <HighlightText :text="foldText(r)" :query="search" />
+          <button v-if="needsFold(r)" class="iact fold" @click.stop="toggleFold(r)">{{ isFolded(r) ? "展开" : "收起" }}</button>
         </div>
-        <div v-if="isRoundOpen(id, r, isLastOf(r))" class="round-bd">
-          <div v-if="r.think" class="r-think"><span class="rlabel">思考</span><HighlightText :text="r.think" :query="search" /></div>
-          <div v-if="showSay(r)" class="r-say"><HighlightText :text="r.say" :query="search" /></div>
-
-          <div v-for="a in r.actions" :key="a.id" class="act-row" :class="{ err: !a.ok }">
-            <div class="act-hd" :class="{ clickable: a.out || preview(a).length || av(a).detail }" @click="toggleAct(a)">
-              <span class="aicon" :class="'k-' + av(a).kind">{{ av(a).icon }}</span>
-              <span class="alabel">{{ av(a).label }}</span>
-              <span class="atarget"><HighlightText :text="av(a).target" :query="search" /></span>
-              <span class="atail">{{ av(a).tail }}</span>
-              <span class="sp"></span>
-              <span v-if="a.out || preview(a).length || av(a).detail" class="acaret">{{ aOpen(a) ? "收起" : "展开" }}</span>
-            </div>
-            <pre v-if="aOpen(a) && a.out" class="aout" :class="{ err: !a.ok }"><HighlightText :text="a.out" :query="search" /></pre>
-            <div v-if="aOpen(a) && preview(a).length" class="adiff">
-              <div v-for="(l, i) in preview(a)" :key="i" :class="l.sign === '+' ? 'plus' : 'minus'">{{ l.sign }} {{ l.text }}</div>
-            </div>
-            <pre v-if="aOpen(a) && !a.out && av(a).kind === 'other' && av(a).detail" class="aout dim">{{ av(a).detail }}</pre>
+        <div v-else-if="r.kind === 'say'" class="l-say">
+          <HighlightText :text="foldText(r)" :query="search" />
+          <button v-if="needsFold(r)" class="iact fold" @click.stop="toggleFold(r)">{{ isFolded(r) ? "展开" : "收起" }}</button>
+        </div>
+        <div v-else-if="r.kind === 'end'" class="l-end">{{ r.text }}</div>
+        <pre v-else-if="r.kind === 'report'" class="l-report"><HighlightText :text="foldText(r)" :query="search" /></pre>
+        <pre v-else-if="r.kind === 'out' || r.kind === 'err'" class="l-out" :class="{ 'l-err': r.kind === 'err' }"><HighlightText :text="foldText(r)" :query="search" /></pre>
+        <button v-if="needsFold(r) && (r.kind === 'report' || r.kind === 'out' || r.kind === 'err')" class="iact fold" @click.stop="toggleFold(r)">{{ isFolded(r) ? "展开" : "收起" }}</button>
+        <div v-else class="act-row">
+          <div class="act-hd" :class="{ clickable: r.out || preview(r).length || av(r).detail }" @click="toggleAct(r)">
+            <span class="aicon" :class="'k-' + av(r).kind">{{ av(r).icon }}</span>
+            <span class="alabel">{{ av(r).label }}</span>
+            <span class="atarget"><HighlightText :text="av(r).target" :query="search" /></span>
+            <span class="atail">{{ av(r).tail }}</span>
+            <span class="sp"></span>
+            <span v-if="r.out || preview(r).length || av(r).detail" class="acaret">{{ aOpen(r) ? "收起" : "展开" }}</span>
           </div>
+          <pre v-if="aOpen(r) && r.out" class="aout" :class="{ err: r.ok === false }"><HighlightText :text="r.out" :query="search" /></pre>
+          <div v-if="aOpen(r) && preview(r).length" class="adiff">
+            <div v-for="(l, i) in preview(r)" :key="i" :class="l.sign === '+' ? 'plus' : 'minus'">{{ l.sign }} {{ l.text }}</div>
+          </div>
+          <pre v-if="aOpen(r) && !r.out && av(r).kind === 'other' && av(r).detail" class="aout dim">{{ av(r).detail }}</pre>
         </div>
       </div>
 
-      <div v-if="his?.end" class="r-end">
-        <div class="end-hd">
-          结束 · {{ his.end.status }}<template v-if="his.end.turns"> · {{ his.end.turns }} 轮</template>
-          <template v-if="his.end.cost"> · ${{ Number(his.end.cost).toFixed(3) }}</template>
-        </div>
-        <pre v-if="his.end.result" class="r-report"><HighlightText :text="his.end.result" :query="search" /></pre>
+      <div v-if="latest" class="l-wait">
+        等待人工授权（{{ remain(latest) > 0 ? "剩 " + remain(latest) + "s" : "已超时" }}）· 在底部批准或拒绝
       </div>
-      <pre v-else-if="fallbackResult" class="r-report">{{ fallbackResult }}</pre>
+      <pre v-if="fallbackResult" class="r-report">{{ fallbackResult }}</pre>
     </div>
+
+    <div v-if="stale && !staleHidden" class="auth-dock stale">
+      <div class="dock-line">
+        <span class="pulse warn"><i></i>AUTH</span>
+        <b class="dock-n">{{ stale.status === "expired" ? "已超时" : "已拒绝" }}</b>
+        <span class="dock-ctx">这次调用按拒绝执行（{{ (stale.decidedAt || stale.rejectedAt || stale.at || "").slice(11, 19) }}）</span>
+        <span class="sp"></span>
+        <button class="iact" :disabled="isRunning(id)" @click.stop="resumeTask(task)">接着跑（续接）</button>
+        <button class="iact" @click.stop="staleHidden = true">放弃</button>
+      </div>
+    </div>
+
+    <ApprovalDock :task="task" />
 
     <button v-if="!isAtBottom(id)" class="jump" @click.stop="scrollBottom(id)">
       ↓ {{ pendingNew[id] ? pendingNew[id] + " 条新输出" : "底部" }}

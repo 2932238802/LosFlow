@@ -2,13 +2,14 @@
 import SheetShell from "../components/SheetShell.vue";
 import { s } from "../store/useAppState";
 import { closePick, newProject, openProj, pickProject } from "../store/useProjects";
+import { envLabel } from "../utils/format";
 </script>
 
 <template>
   <SheetShell title="选项目" @close="closePick">
     <div class="dirs" style="max-height:320px">
       <div v-for="pr in s?.projects || []" :key="pr.id" class="dir" :class="{ picked: pr.path === newProject }" @click="pickProject(pr.path)">
-        {{ pr.name }} <span class="pmeta">{{ pr.path }}</span>
+        {{ pr.name }} <span class="pmeta">{{ envLabel(pr.resolvedEnv) }} · {{ pr.path }}</span>
       </div>
       <div v-if="!(s?.projects || []).length" class="empty">— 还没有项目 —</div>
     </div>

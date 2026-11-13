@@ -1,5 +1,16 @@
 // 纯展示 / 文案函数，不碰状态。
-import type { Approval, Area, Task } from "../types";
+import type { Approval, Area, EnvName, Task, WorkType } from "../types";
+
+// 派单环境角标：WSL2 / Windows
+type EnvModeLike = "wsl" | "windows" | "auto" | "" | undefined;
+export function envLabel(e?: EnvName | EnvModeLike): string {
+  return e === "windows" ? "Windows" : "WSL2";
+}
+
+// 回执缺金额时显示「—」，不要伪装成 $0.000
+export function fmtUsd(v?: number | null): string {
+  return v === null || v === undefined ? "—" : `$${Number(v).toFixed(3)}`;
+}
 
 export function pct(t: Task): number {
   if (t.status === "done") return 100;
@@ -22,8 +33,20 @@ export function stageInfo(t: Task, running: boolean): { text: string; tone: stri
   return { text: "待派单", tone: "wait" };
 }
 
+// 工作类型：入池时就定；旧数据的 review 按「文档」处理
+export const WORK_TYPES: { value: WorkType; label: string }[] = [
+  { value: "dev", label: "开发" },
+  { value: "docs", label: "文档" },
+  { value: "plan", label: "Plan" },
+];
+
+export function normWorkType(w?: string): WorkType {
+  if (w === "review") return "docs";
+  return w === "docs" || w === "plan" ? w : "dev";
+}
+
 export function typeLabel(w?: string): string {
-  const map: Record<string, string> = { dev: "开发", review: "review", plan: "Plan" };
+  const map: Record<string, string> = { dev: "开发", docs: "文档", plan: "Plan", review: "文档" };
   return map[w || "dev"] || w || "";
 }
 

@@ -1,6 +1,6 @@
 import { computed, ref } from "vue";
 import { getJSON, post } from "../api";
-import type { Task } from "../types";
+import type { EnvMode, Task } from "../types";
 import { refresh, s } from "./useAppState";
 import { askConfirm } from "./useConfirm";
 import { flash } from "./useToast";
@@ -9,6 +9,8 @@ export const newProject = ref("");
 export const projOpen = ref(false);
 export const projName = ref("");
 export const projPath = ref("~");
+// 项目环境：auto（按路径判定，默认）/ wsl / windows
+export const projEnv = ref<EnvMode>("auto");
 export const projDirs = ref<string[]>([]);
 export const projParent = ref("");
 export const projErr = ref("");
@@ -36,10 +38,17 @@ export function closeProj() {
 export function setProjName(v: string) {
   projName.value = v;
 }
+export function setProjPath(v: string) {
+  projPath.value = v;
+}
+export function setProjEnv(v: string) {
+  projEnv.value = v === "wsl" || v === "windows" ? v : "auto";
+}
 
 export async function openProj() {
   projOpen.value = true;
   projName.value = "";
+  projEnv.value = "auto";
   projErr.value = "";
   await browse("~");
 }
@@ -60,7 +69,7 @@ export async function saveProj() {
   const name = projName.value.trim();
   if (!name) return flash("给项目起个名字", true);
   try {
-    await post("/api/projects/add", { name, path: projPath.value });
+    await post("/api/projects/add", { name, path: projPath.value, env: projEnv.value });
     projOpen.value = false;
     newProject.value = projPath.value;
     flash(`已添加项目 ${name}`);
@@ -89,9 +98,11 @@ export async function delProj(id: string) {
 }
 
 // ---- 任务卡「改目录」：复用同一套 WSL 目录浏览，不再用原生 prompt ----
+// Windows 目录没法用 WSL 浏览（也没必要）：可以直接在输入框里填 D:\... 再确认。
 export const repoOpen = ref(false);
 export const repoFor = ref<Task | null>(null);
 export const repoPath = ref("~");
+export const repoEnv = ref<EnvMode>("auto");
 export const repoDirs = ref<string[]>([]);
 export const repoParent = ref("");
 export const repoErr = ref("");
@@ -100,7 +111,15 @@ export function openRepo(t: Task) {
   repoFor.value = t;
   repoOpen.value = true;
   repoErr.value = "";
+  repoEnv.value = "auto";
   browseRepo((t.repo || "~/LosAngelous/Vesta").trim() || "~");
+}
+
+export function setRepoPath(v: string) {
+  repoPath.value = v;
+}
+export function setRepoEnv(v: string) {
+  repoEnv.value = v === "wsl" || v === "windows" ? v : "auto";
 }
 
 export function closeRepo() {
@@ -124,10 +143,10 @@ export async function chooseRepo() {
   const t = repoFor.value;
   if (!t) return;
   try {
-    await post("/api/task/repo", { id: t.id, repo: repoPath.value });
+    const r = await post("/api/task/repo", { id: t.id, repo: repoPath.value, env: repoEnv.value });
     const path = repoPath.value;
     closeRepo();
-    flash(`#${t.id} 工作目录改为 ${path}`);
+    flash(`#${t.id} 工作目录改为 ${path}（${r.env === "windows" ? "Windows" : "WSL2"}）`);
     refresh();
   } catch (e: any) {
     repoErr.value = e.message;

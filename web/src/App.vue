@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import AppSidebar from "./components/AppSidebar.vue";
+import RunProgress from "./components/RunProgress.vue";
 import ConfirmDialog from "./dialogs/ConfirmDialog.vue";
 import MarkDialog from "./dialogs/MarkDialog.vue";
 import ProjectDialog from "./dialogs/ProjectDialog.vue";
@@ -44,6 +45,7 @@ const page = computed(() => PAGES[view.value as keyof typeof PAGES] || TasksView
 
     <main class="main" :class="{ wide: view === 'terminals' }">
       <div class="msg" :class="{ err }">{{ msg }}</div>
+      <RunProgress />
 
       <KeepAlive>
         <component :is="page" />

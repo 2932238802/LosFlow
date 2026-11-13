@@ -1,17 +1,12 @@
 import { reactive, ref } from "vue";
 import { getJSON, post } from "../api";
 import type { Task } from "../types";
-import { buildEvidence, docsDefault, repoOf } from "../utils/format";
+import { buildEvidence, docsDefault, normWorkType, repoOf } from "../utils/format";
 import { refresh } from "./useAppState";
 import { askConfirm } from "./useConfirm";
 import { flash } from "./useToast";
 
-// 「标记完成」：类型 + 区域 + 证据（人验收后才推进任务状态）
-export const WORK_TYPES = [
-  { value: "dev", label: "开发" },
-  { value: "review", label: "review" },
-  { value: "plan", label: "Plan" },
-];
+// 「标记完成」：区域 + 证据。工作类型在入池/推入时就定了，这里不再选。
 export const markFor = ref<Task | null>(null);
 export const markForm = reactive({ workType: "dev", areaKind: "code" as "code" | "docs", path: "", evidence: "" });
 export const markDirs = ref<string[]>([]);
@@ -59,7 +54,7 @@ async function fillEvidence(t: Task) {
 
 export function openMark(t: Task) {
   markFor.value = t;
-  const wt = t.workType && ["dev", "review", "plan"].includes(t.workType) ? t.workType : "dev";
+  const wt = normWorkType(t.workType);
   const kind: "code" | "docs" = t.area?.kind === "docs" ? "docs" : t.area?.kind === "code" ? "code" : wt === "dev" ? "code" : "docs";
   markForm.workType = wt;
   markForm.areaKind = kind;
@@ -69,20 +64,6 @@ export function openMark(t: Task) {
   markErr.value = "";
   fillEvidence(t);
   if (kind === "docs") browseDocs(markForm.path);
-}
-
-export function pickWorkType(v: string) {
-  markForm.workType = v;
-  if (!markFor.value) return;
-  // 开发默认代码区；review / Plan 默认文档区，路径给任务仓库下的 docs/
-  if (v === "dev") {
-    markForm.areaKind = "code";
-    markForm.path = repoOf(markFor.value);
-  } else {
-    markForm.areaKind = "docs";
-    if (!markForm.path || markForm.path === repoOf(markFor.value)) markForm.path = docsDefault(markFor.value);
-    browseDocs(markForm.path);
-  }
 }
 
 export function pickAreaKind(k: "code" | "docs") {
@@ -107,7 +88,6 @@ export async function submitMark() {
     await post("/api/task/status", {
       id: t.id,
       status: "done",
-      workType: markForm.workType,
       area: { kind: markForm.areaKind, path: path || repoOf(t) },
       evidence: markForm.evidence.trim(),
     });
