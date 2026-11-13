@@ -81,7 +81,7 @@
 param(
     [string]$Task,
     [string]$TaskFile,
-    [string]$Repo = '~/LosAngelous/Vesta',
+    [string]$Repo = '',
     [ValidateSet('read', 'write')]
     [string]$Mode = 'read',
     [string]$Allow = '',
@@ -93,7 +93,7 @@ param(
     [int]$DedupeMinutes = 30,
     [switch]$Force,
     [switch]$DryRun,
-    [string]$Distro = 'Ubuntu-26.04',
+    [string]$Distro = '',
     [int]$TimeoutSec = 600,
     [string]$OutDir = '',
     [double]$MaxBudget = 0,
@@ -102,6 +102,15 @@ param(
     [switch]$JsonOut,
     [switch]$NoApproval
 )
+
+# ---------- paths ----------
+# 仪表盘调用时不带 -OutDir / -Distro / -Repo，必须在这里补默认值；
+# 否则 Join-Path '' 'runs' 会直接抛 "Path 为空字符串"，脚本 1 秒退出、没有回执。
+. (Join-Path $PSScriptRoot '_paths.ps1')
+$cfg = Get-DsPaths
+if (-not $OutDir) { $OutDir = $cfg.progressDir }
+if (-not $Distro) { $Distro = $cfg.wslDistro }
+if (-not $Repo) { $Repo = $cfg.wslRepo }
 
 # ---------- UTF-8 stdout ----------
 # Without this, the same script writes GBK when launched from a service/console-less parent

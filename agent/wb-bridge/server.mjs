@@ -14,9 +14,10 @@
 //   WB_TASKS_FILE   任务表路径，默认 D:\PROJECT\Ds\_progress\Vesta.tasks.json
 
 import { createInterface } from "node:readline";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync } from "node:fs";
+import { readFileSync, existsSync, mkdirSync, appendFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { loadPaths } from "../../server/paths.mjs";
+import { mutate } from "../../server/store.mjs";
 import * as docsync from "../../server/docsync.mjs";
 import { fileURLToPath } from "node:url";
 const DATA_DIR = join(fileURLToPath(new URL("../../data/", import.meta.url)));
@@ -61,17 +62,28 @@ function loadTasks() {
 
 function saveTasks(tasks) {
   try {
-    appendFileSync("D:\\Temp\\tasks-writes.log", new Date().toISOString() + " wb-bridge.write\n" + new Error().stack + "\n");
-  } catch {}
-  const dir = dirname(TASKS_FILE);
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  writeFileSync(TASKS_FILE, JSON.stringify(tasks, null, 2), "utf8");
+    const dir = dirname(TASKS_FILE);
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  } catch {
+    /* ignore */
+  }
+  return mutate(TASKS_FILE, () => tasks);
 }
 
 function nowIso() {
   const d = new Date();
   const p = (n) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+// 文档同步类任务不占任务表：docOnly 标记的、或 WorkBuddy 名下带文档操作指令的，
+// 都不该被 next_task 当成普通任务取走。
+function isDocOnlyTask(t) {
+  if (t.docOnly) return true;
+  return (
+    (t.owner || "") === "workbuddy" &&
+    docsync.isDocSyncInstruction([t.subject, t.note].filter(Boolean).join("\n"))
+  );
 }
 
 function renderTasks(tasks) {
@@ -116,12 +128,13 @@ const tools = [
       const t = tasks.find(
         (x) =>
           x.status === "todo" &&
+          !isDocOnlyTask(x) &&
           (!want || String(x.owner || "") === want)
       );
       if (!t) return want ? `暂无分配给 ${want} 的待办任务。` : "暂无待办任务。";
       t.status = "doing";
       t.updatedAt = Date.now();
-      saveTasks(tasks);
+      await saveTasks(tasks);
       return [
         `任务 #${t.id}: ${t.subject}`,
         t.note ? `备注: ${t.note}` : "",
@@ -153,25 +166,39 @@ const tools = [
       t.status = args.status;
       if (args.evidence) t.evidence = args.evidence;
       t.updatedAt = Date.now();
-      saveTasks(tasks);
+      await saveTasks(tasks);
       return `任务 #${t.id} 已回填为 ${t.status}。`;
     },
   },
   {
     name: "next_docsync",
     description:
-      "取一条待写的腾讯文档同步任务（异步队列），标记为 running 并返回要写的内容。没有任务时返回「暂无文档同步任务」。写完必须调 report_docsync 回执。",
+      "取一条待写的腾讯文档同步任务（异步队列），标记为 running 并返回要写的内容。动作可能是 append-row（追加一行）、update-row（回填已有行）或 cleanup（整理主表）。没有任务时返回「暂无文档同步任务」。写完必须调 report_docsync 回执。",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
     run: async () => {
-      const j = docsync.nextJob();
+      const j = await docsync.nextJob();
       if (!j) return "暂无文档同步任务。";
+      if (j.action === "cleanup") {
+        return [
+          `文档同步 #${j.id}（整理主表 · 第 ${j.attempts} 次尝试）`,
+          `表格：${j.docUrl}`,
+          j.payload.note || "动作：整理主表 —— 把已完成/已搁置的行移到归档 tab。",
+          "写完用 report_docsync 回执：{id, status: \"done\", evidence: 移动行数+读回校验}",
+          "做不到就回填 failed，写清卡在哪一步 + 报错原文（会自动重试）。",
+        ]
+          .filter(Boolean)
+          .join("\n");
+      }
+      const isUpdate = j.action === "update-row";
       return [
         `文档同步 #${j.id}（对应任务 #${j.taskId}·第 ${j.attempts} 次尝试）`,
         `表格：${j.docUrl}`,
-        "动作：append-row —— 在主表末尾追加一行；序号列不手写（沿用已有公式）",
+        isUpdate
+          ? "动作：update-row —— 在主表「任务」列找到名称等于下面任务的那一行（有多行取最后一行），只改【任务状态】和【备注】两列；找不到这一行就按 append-row 追加一行。不要动其他行、列、公式、格式"
+          : "动作：append-row —— 在主表末尾追加一行；序号列不手写（沿用已有公式）",
         `任务：${j.payload.subject}`,
         `任务状态：${j.payload.status}`,
-        `优先级：${j.payload.priority}`,
+        j.payload.priority ? `优先级：${j.payload.priority}` : "",
         j.payload.note ? `备注：${j.payload.note}` : "",
         "写完用 report_docsync 回执：{id, status: \"done\", evidence: 行号+读回校验}",
         "做不到就回填 failed，写清卡在哪一步 + 报错原文（会自动重试）。",
@@ -195,13 +222,13 @@ const tools = [
       additionalProperties: false,
     },
     run: async (args) => {
-      const j = docsync.report({ id: args.id, status: args.status, evidence: args.evidence });
+      const j = await docsync.report({ id: args.id, status: args.status, evidence: args.evidence });
       return `文档同步 #${j.id} → ${j.status}（已试 ${j.attempts} 次）`;
     },
   },
   {
     name: "add_task",
-    description: "新增一条任务（默认 status=todo）。",
+    description: "新增一条任务（默认 status=todo）。写腾讯文档的操作指令会被拒绝——那类活走文档同步队列。",
     inputSchema: {
       type: "object",
       properties: {
@@ -213,6 +240,12 @@ const tools = [
       additionalProperties: false,
     },
     run: async (args) => {
+      // 写腾讯文档是默认后台行为，走 docsync 队列，不占任务表、不进终端
+      if (docsync.isDocSyncInstruction([args.subject, args.note].filter(Boolean).join("\n"))) {
+        throw new Error(
+          "拒绝建任务：这是腾讯文档操作指令。写表格请走文档同步队列（next_docsync → 写完 → report_docsync），它不占任务行、不进终端。"
+        );
+      }
       const tasks = loadTasks();
       const maxId = tasks.reduce((m, t) => Math.max(m, Number(t.id) || 0), 0);
       const t = {
@@ -226,7 +259,7 @@ const tools = [
         updatedAt: Date.now(),
       };
       tasks.push(t);
-      saveTasks(tasks);
+      await saveTasks(tasks);
       return `已新增任务 #${t.id}: ${t.subject}（${nowIso()}）`;
     },
   },

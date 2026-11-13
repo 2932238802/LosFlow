@@ -10,8 +10,9 @@
 //
 // 超时回收：running 超过 STALE_MS 视为卡死，退回 pending 让别人再取。
 
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
+import { mutate } from "./store.mjs";
 
 export const DEFAULT_DOC =
   "https://docs.qq.com/sheet/DZVFSeURwdmVJdVZL?tab=BB08J2";
@@ -36,13 +37,26 @@ export function loadQueue() {
   }
 }
 
-function save(list) {
-  writeFileSync(file(), JSON.stringify(list, null, 2), "utf8");
-}
-
 function nextId(list) {
   const max = list.reduce((m, x) => Math.max(m, Number(String(x.id).replace(/\D/g, "")) || 0), 0);
   return "d" + (max + 1);
+}
+
+// 判定一段文字是不是「写腾讯文档」的活。
+//
+// 写表格是默认后台行为：只走本队列 → WorkBuddy，不建任务、不进任务池、不进终端、
+// 不派给 Claude Code。新建任务入口（taskboard.ps1 -Add / wb-bridge add_task）
+// 用这个判定从源头拦住；服务端派单前也用它兜底。
+const DOC_URL_RE = /docs\.qq\.com/i;
+const DOC_WRITE_RE = /append-row|update-row|整理(?:腾讯文档)?主表|腾讯文档任务表/i;
+const DOC_ACTION_RE = /(追加|新增|写入|补写|整理|归档|移(?:到|入|出|至))/;
+export function isDocSyncInstruction(text) {
+  const s = String(text || "");
+  if (!s) return false;
+  // 明确的队列动作词，不看 URL 也算文档活
+  if (DOC_WRITE_RE.test(s)) return true;
+  // 给了腾讯文档地址，又带着「写」的动作，就是文档同步指令
+  return DOC_URL_RE.test(s) && DOC_ACTION_RE.test(s);
 }
 
 function reclaimStale(list) {
@@ -59,83 +73,160 @@ function reclaimStale(list) {
   return changed;
 }
 
+// 读-改-写全部在 mutate 回调里完成：并发入队（推入时 Promise.all）不会互相覆盖。
+async function updateQueue(fn) {
+  let out = null;
+  await mutate(file(), (cur) => {
+    const list = Array.isArray(cur) ? cur : [];
+    reclaimStale(list);
+    out = fn(list);
+    return list;
+  });
+  return out;
+}
+
 // 入队：一条任务对应一条文档同步（写一行「开发中」）
 export function enqueue({ taskId, subject, priority, status = "开发中", note = "", docUrl } = {}) {
-  const list = loadQueue();
-  reclaimStale(list);
-  const now = Date.now();
-  const it = {
-    id: nextId(list),
-    taskId: String(taskId || ""),
-    action: "append-row",
-    docUrl: docUrl || DEFAULT_DOC,
-    payload: { subject: String(subject || ""), priority: priority || "中", status, note: String(note || "") },
-    status: "pending",
-    attempts: 0,
-    lastError: "",
-    createdAt: now,
-    updatedAt: now,
+  return updateQueue((list) => {
+    const now = Date.now();
+    const it = {
+      id: nextId(list),
+      taskId: String(taskId || ""),
+      action: "append-row",
+      docUrl: docUrl || DEFAULT_DOC,
+      payload: { subject: String(subject || ""), priority: priority || "中", status, note: String(note || "") },
+      status: "pending",
+      attempts: 0,
+      lastError: "",
+      createdAt: now,
+      updatedAt: now,
+    };
+    list.push(it);
+    return it;
+  });
+}
+
+// 入队：回填一条任务（人在终端里标完成 → 类型 + 区域）
+// action=update-row：WorkBuddy 在主表里按任务名找到那一行，只改状态与备注；
+// 找不到（推入时那行还没写进去）就按 append-row 追加，不会丢。
+export function enqueueBackfill({ taskId, subject, workType, area } = {}) {
+  const typeLabel = { dev: "开发", review: "review", plan: "Plan" }[workType] || String(workType || "开发");
+  const kind = area && area.kind === "docs" ? "文档区" : "代码区";
+  const path = String((area && area.path) || "").trim();
+  const payload = {
+    subject: String(subject || ""),
+    status: "已完成",
+    priority: "",
+    note: `类型：${typeLabel}；区域：${kind}${path ? " " + path : ""}`,
   };
-  list.push(it);
-  save(list);
-  return it;
+  return updateQueue((list) => {
+    const now = Date.now();
+    // 同一条任务已经有排队中的回填 → 覆盖成最新内容，不重复入队
+    const exist = list.find(
+      (x) => x.action === "update-row" && String(x.taskId) === String(taskId) && ["pending", "running"].includes(x.status)
+    );
+    if (exist) {
+      exist.payload = payload;
+      exist.updatedAt = now;
+      return exist;
+    }
+    const it = {
+      id: nextId(list),
+      taskId: String(taskId || ""),
+      action: "update-row",
+      docUrl: DEFAULT_DOC,
+      payload,
+      status: "pending",
+      attempts: 0,
+      lastError: "",
+      createdAt: now,
+      updatedAt: now,
+    };
+    list.push(it);
+    return it;
+  });
+}
+
+// 入队：整理主表（维护动作）。写文档是默认后台行为，不建任务、不进任务池、不派终端。
+// taskId 留空：这不是哪条开发任务的同步，WorkBuddy 取到后按 payload.note 独立执行。
+export function enqueueMaintenance({ note = "", docUrl } = {}) {
+  return updateQueue((list) => {
+    const now = Date.now();
+    // 已经有一条排队 / 在跑的整理 → 只更新内容，不重复入队（连点按钮也只排一条）
+    const exist = list.find((x) => x.action === "cleanup" && ["pending", "running"].includes(x.status));
+    if (exist) {
+      if (note) exist.payload.note = String(note);
+      exist.updatedAt = now;
+      return exist;
+    }
+    const it = {
+      id: nextId(list),
+      taskId: "",
+      action: "cleanup",
+      docUrl: docUrl || DEFAULT_DOC,
+      payload: { subject: "整理腾讯文档主表", priority: "", status: "", note: String(note || "") },
+      status: "pending",
+      attempts: 0,
+      lastError: "",
+      createdAt: now,
+      updatedAt: now,
+    };
+    list.push(it);
+    return it;
+  });
 }
 
 // 取活：拿一条 pending，标 running 并 +1 次数
 export function nextJob() {
-  const list = loadQueue();
-  const changed = reclaimStale(list);
-  const it = list.find((x) => x.status === "pending");
-  if (!it) {
-    if (changed) save(list);
-    return null;
-  }
-  it.status = "running";
-  it.attempts = (Number(it.attempts) || 0) + 1;
-  it.startedAt = Date.now();
-  it.updatedAt = Date.now();
-  save(list);
-  return it;
+  return updateQueue((list) => {
+    const it = list.find((x) => x.status === "pending");
+    if (!it) return null;
+    it.status = "running";
+    it.attempts = (Number(it.attempts) || 0) + 1;
+    it.startedAt = Date.now();
+    it.updatedAt = Date.now();
+    return it;
+  });
 }
 
 // 回调：done / failed（失败且还有额度就退回 pending，等下一轮）
 export function report({ id, status, evidence = "" } = {}) {
-  const list = loadQueue();
-  const it = list.find((x) => String(x.id) === String(id));
-  if (!it) throw new Error("没有这条文档同步: " + id);
-  if (!["done", "failed"].includes(status)) throw new Error("status 只能是 done / failed");
-  it.updatedAt = Date.now();
-  if (status === "done") {
-    it.status = "done";
-    it.evidence = String(evidence || "");
-    it.lastError = "";
-    it.doneAt = Date.now();
-  } else {
-    it.lastError = String(evidence || "未给原因");
-    it.evidence = "";
-    if ((Number(it.attempts) || 0) >= MAX_ATTEMPTS) {
-      it.status = "failed";
+  if (!["done", "failed"].includes(status)) return Promise.reject(new Error("status 只能是 done / failed"));
+  return updateQueue((list) => {
+    const it = list.find((x) => String(x.id) === String(id));
+    if (!it) throw new Error("没有这条文档同步: " + id);
+    it.updatedAt = Date.now();
+    if (status === "done") {
+      it.status = "done";
+      it.evidence = String(evidence || "");
+      it.lastError = "";
+      it.doneAt = Date.now();
     } else {
-      it.status = "pending";
+      it.lastError = String(evidence || "未给原因");
+      it.evidence = "";
+      it.status = (Number(it.attempts) || 0) >= MAX_ATTEMPTS ? "failed" : "pending";
     }
-  }
-  save(list);
-  if (status === "done") markTaskSynced(it.taskId);
-  return it;
+    return it;
+  }).then(async (it) => {
+    if (status === "done") await markTaskSynced(it.taskId);
+    return it;
+  });
 }
 
 // 回调成功就顺手把任务表里的这一条标成「台账已同步」，面板进度条靠它推进
-function markTaskSynced(taskId) {
+async function markTaskSynced(taskId) {
   if (!taskId) return;
   try {
     const tf = join(PATHS.dataDir, "Vesta.tasks.json");
     if (!existsSync(tf)) return;
-    const tasks = JSON.parse(readFileSync(tf, "utf8"));
-    const t = tasks.find((x) => String(x.id) === String(taskId));
-    if (!t) return;
-    t.docSyncedAt = Date.now();
-    t.updatedAt = Date.now();
-    writeFileSync(tf, JSON.stringify(tasks, null, 2), "utf8");
+    await mutate(tf, (tasks) => {
+      const list = Array.isArray(tasks) ? tasks : [];
+      const t = list.find((x) => String(x.id) === String(taskId));
+      if (!t) return list;
+      t.docSyncedAt = Date.now();
+      t.updatedAt = Date.now();
+      return list;
+    });
   } catch {
     /* 任务表写不进去不影响同步结果 */
   }

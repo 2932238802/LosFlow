@@ -2,14 +2,15 @@
 
 **定位：DSH 插件 + 工作流驾驶舱。** 把「提需求 → 拆任务 → 派给 Claude Code → 看它干 → 收授权 → 台账落文档」这一整条流水线做成看得见、管得住的一处。
 
-不是另一个聊天框，而是 DSH 右边那块**干活的面板**：任务池、终端回放、授权队列、腾讯文档同步。
+不是另一个聊天框，而是 DSH 右边那块**干活的面板**：任务池、会话回放、授权队列、腾讯文档同步。
 
 ## 一条任务的生命
 
 ```
 加入池子 → 拆分(cc:/wb:) → 推入 ─┬─ 任务本体：立刻可开工，派给 Claude Code（或在池子里等）
                                  └─ 文档那一行：异步入队，WorkBuddy 有空再写，写完回调
-派单 → 终端里看它思考/命令/结果 → 撞权限墙 → 右侧授权栏批准 → 规则进 allowlist → 自动重派一次
+派单 → 会话里看它思考/命令/结果 → 撞权限墙 → 右侧授权栏批准 → 规则进 allowlist → 自动重派一次
+验收 → 会话里点「标记完成」标注类型（开发 / review / Plan）与区域（代码区 / 文档区）
 回填 → 台账 + 腾讯文档任务表 → 归档
 ```
 
@@ -73,7 +74,8 @@ npm run smoke     # 起临时端口，断言 /api/state、/api/docsync、/app/�
 | `docsync.json` | 文档同步队列（异步回调） |
 | `approvals.json` / `allowlist.json` | 授权队列与已放行规则 |
 | `claude-ledger.jsonl` | 派单台账（花费/轮次/回执摘要） |
-| `runs/` | 每次派单的 stream-json 归档（终端回放来源） |
+| `runs/` | 每次派单的回执台账 |
+| `streams/` | 每次派单的 stream-json 回放归档（默认保留 7 天，随清理一起删） |
 | `calls.jsonl` | WorkBuddy 的 MCP 调用记录 |
 
 全部 git 忽略。换机器时拷 `data/` 即可接上历史。
@@ -81,7 +83,7 @@ npm run smoke     # 起临时端口，断言 /api/state、/api/docsync、/app/�
 ## 开发约定
 
 - 后端零依赖：只用 Node 内置模块，不开框架。
-- 前端只有一个入口 `web/src/App.vue`，改动前先看 `docs/architecture.md` 的组件边界。
+- 前端入口 `web/src/App.vue` 只做 shell；视图在 `web/src/views/`，跨视图状态在 `web/src/store/`，新增视图照着现有目录加。改动前先看 `docs/architecture.md` 的前端边界。
 - 涉及工作流语义（阶段、推入、文档同步、授权）的改动，**先改 `docs/`，再改代码**。
 - 提交前跑 `npm run smoke`；动前端再加 `npm run build`。
 - 机器相关的路径/端口不要写死在代码里，走 `losflow.config.json` 或环境变量（`server/paths.mjs`、`agent/_paths.ps1`）。

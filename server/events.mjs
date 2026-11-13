@@ -4,7 +4,8 @@
 //          边跑边推；换文件时先发一条 reset。
 // WorkBuddy：tail tools/wb-bridge/calls.jsonl。
 
-import { readFileSync, existsSync, statSync, readdirSync } from "node:fs";
+import { readFileSync, existsSync, statSync, readdirSync, createReadStream } from "node:fs";
+import { createInterface } from "node:readline";
 import { join } from "node:path";
 
 let PATHS = null;
@@ -118,34 +119,57 @@ export function readRunEvents(dispatchId) {
   }
 }
 
+function clockOf(ts) {
+  if (!ts) return clock();
+  const d = new Date(ts);
+  return Number.isNaN(d.getTime()) ? clock() : d.toTimeString().slice(0, 8);
+}
+
 function rawLine(o) {
   if (o.type === "assistant" && o.message?.content) {
     const out = [];
+    const msgId = o.message.id || o.uuid || "";
+    const at = clockOf(o.timestamp);
     for (const b of o.message.content) {
       if (b.type === "thinking" && (b.thinking || "").trim()) {
         // 思考过程：就是 claude 终端里那段灰字
-        out.push({ kind: "think", text: b.thinking.trim().slice(0, 4000) });
-      } else if (b.type === "text" && b.text?.trim()) out.push({ kind: "say", text: b.text.trim().slice(0, 600) });
+        out.push({ kind: "think", text: b.thinking.trim().slice(0, 4000), msgId, at });
+      } else if (b.type === "text" && b.text?.trim()) out.push({ kind: "say", text: b.text.trim().slice(0, 600), msgId, at });
       else if (b.type === "tool_use") {
         let inp = "";
         try { inp = JSON.stringify(b.input || {}); } catch { inp = ""; }
-        out.push({ kind: "cmd", text: "$ " + b.name + " " + inp.slice(0, 400) });
+        out.push({
+          kind: "cmd",
+          text: "$ " + b.name + " " + inp.slice(0, 400),
+          tool: b.name || "",
+          input: b.input || {},
+          actionId: b.id || "",
+          msgId,
+          at,
+        });
       }
     }
     return out;
   }
   if (o.type === "user" && Array.isArray(o.message?.content)) {
     const out = [];
+    const at = clockOf(o.timestamp);
     for (const b of o.message.content) {
       if (b.type === "tool_result") {
         const txt = Array.isArray(b.content) ? b.content.map((x) => x.text || "").join(" ") : String(b.content ?? "");
-        out.push({ kind: b.is_error ? "err" : "out", text: txt.slice(0, 800) });
+        out.push({
+          kind: b.is_error ? "err" : "out",
+          text: txt.slice(0, 4000),
+          ok: !b.is_error,
+          actionId: b.tool_use_id || "",
+          at,
+        });
       }
     }
     return out;
   }
   if (o.type === "result") {
-    const out = [{ kind: "end", text: "--- 结束 " + (o.is_error ? o.subtype : "ok") + " · " + o.num_turns + " 轮 · $" + Number(o.total_cost_usd || 0).toFixed(3) }];
+    const out = [{ kind: "end", at: clock(), text: "--- 结束 " + (o.is_error ? o.subtype : "ok") + " · " + o.num_turns + " 轮 · $" + Number(o.total_cost_usd || 0).toFixed(3) }];
     // 最终回执全文：终端里最后那一整段结论，别截断
     const full = String(o.result || "").trim();
     if (full) out.push({ kind: "report", text: full.slice(0, 20000) });
@@ -215,6 +239,323 @@ export function streamClaude(req, res) {
     closed = true;
     clearInterval(timer);
     res.end();
+  });
+}
+
+// ---- 多路复用终端流 ----
+//
+// 为什么不每张卡一条 SSE：浏览器同源 HTTP/1.1 并发连接上限 6 条，
+// 已有 workbuddy（+ 可选 state），8 张终端卡各开一条会撞上限。
+// 所以只有一条 /events/losflow，消息体里带 taskId。
+const streamFile = (runId) => `\\\\wsl.localhost\\${DISTRO}\\tmp\\cc-${runId}.stream.jsonl`;
+
+// ---- 轮 / 动作契约（6 号方案 P0）----
+//
+// 旧的 rawLine 把 stream-json 拍平成「行」，这里保留结构：
+//   轮 = 一条 assistant 消息（message.id）+ 紧随其后的 tool_result
+//   动作 = 一次 tool_use + 按 tool_use_id 配对的结果
+//
+// 读文件用流式 readline，不整包 readFileSync：实测单条流最大 11.7 MB。
+const ROUND_WINDOW = 40;
+const MAX_RESP = 2 * 1024 * 1024; // 单响应 2 MB 上限
+
+export function resolveRunFile(runId) {
+  const dir = PATHS.streamsDir || join(PATHS.dataDir, "streams");
+  const archive = join(dir, `${runId}.jsonl`);
+  if (existsSync(archive)) return { file: archive, source: "archive" };
+  const wsl = streamFile(runId);
+  if (existsSync(wsl)) return { file: wsl, source: "wsl" };
+  return { file: "", source: "missing" };
+}
+
+const clip = (s, n) => String(s || "").slice(0, n);
+const safeJson = (v) => {
+  try {
+    return JSON.stringify(v || {});
+  } catch {
+    return "";
+  }
+};
+
+function tsOf(ts) {
+  const t = ts ? Date.parse(ts) : NaN;
+  return Number.isNaN(t) ? 0 : t;
+}
+function clockOfTs(ts) {
+  if (!ts) return "";
+  const d = new Date(ts);
+  return Number.isNaN(d.getTime()) ? "" : d.toTimeString().slice(0, 8);
+}
+
+function linesFromRounds(rounds, end) {
+  const out = [];
+  for (const r of rounds) {
+    if (r.think) out.push({ kind: "think", text: r.think });
+    if (r.say) out.push({ kind: "say", text: r.say });
+    for (const a of r.actions) {
+      out.push({ kind: "cmd", text: `$ ${a.tool} ${safeJson(a.input).slice(0, 400)}` });
+      if (a.out) out.push({ kind: a.ok ? "out" : "err", text: a.out });
+    }
+  }
+  if (end) {
+    out.push({
+      kind: "end",
+      text: `--- 结束 ${end.status === "ok" ? "ok" : end.status} · ${end.turns ?? "?"} 轮 · $${Number(end.cost || 0).toFixed(3)}`,
+    });
+    if (end.result) out.push({ kind: "report", text: end.result });
+  }
+  return out;
+}
+
+// 读一轮窗口；before=<round.i> 往前翻。stats 永远针对全会话。
+export async function readRunRounds(runId, { before = 0, windowSize = ROUND_WINDOW } = {}) {
+  const { file, source } = resolveRunFile(runId);
+  if (!file) {
+    return {
+      dispatch: runId,
+      source: "missing",
+      running: false,
+      truncated: false,
+      hasMore: false,
+      totalRounds: 0,
+      stats: { rounds: 0, tools: 0, errors: 0, files: 0, filesChanged: [], turns: 0, durationMs: 0, cost: 0, lastEventAt: 0 },
+      rounds: [],
+      end: null,
+      lines: [],
+    };
+  }
+
+  const rounds = [];
+  const byAction = new Map();
+  let end = null;
+  let lastAt = 0;
+
+  const rl = createInterface({ input: createReadStream(file, { encoding: "utf8" }), crlfDelay: Infinity });
+  for await (const raw of rl) {
+    // 极速跳过 system:thinking_tokens（实测占 11.7MB 文件里的 5.6 万行）
+    if (!raw || (!raw.includes('"type":"assistant"') && !raw.includes('"type":"user"') && !raw.includes('"type":"result"'))) continue;
+    let o;
+    try {
+      o = JSON.parse(raw);
+    } catch {
+      continue;
+    }
+    if (o.type === "assistant" && Array.isArray(o.message?.content)) {
+      const msgId = o.message.id || o.uuid || "";
+      const at = clockOfTs(o.timestamp);
+      const ts = tsOf(o.timestamp);
+      if (ts) lastAt = Math.max(lastAt, ts);
+      let cur = rounds.length ? rounds[rounds.length - 1] : null;
+      if (!cur || cur.msgId !== msgId) {
+        cur = { i: rounds.length + 1, msgId, at, ts, status: "ok", think: "", say: "", actions: [] };
+        rounds.push(cur);
+      }
+      for (const b of o.message.content) {
+        if (!b) continue;
+        if (b.type === "thinking" && String(b.thinking || "").trim()) {
+          cur.think = clip([cur.think, String(b.thinking).trim()].filter(Boolean).join("\n\n"), 4000);
+        } else if (b.type === "text" && String(b.text || "").trim()) {
+          cur.say = clip([cur.say, String(b.text).trim()].filter(Boolean).join("\n\n"), 2000);
+        } else if (b.type === "tool_use") {
+          const a = {
+            id: b.id || `a${rounds.length}-${cur.actions.length}`,
+            tool: b.name || "",
+            input: b.input || {},
+            ok: true,
+            ms: null,
+            out: "",
+            err: null,
+            at,
+            ts,
+          };
+          cur.actions.push(a);
+          byAction.set(a.id, { action: a, round: cur });
+        }
+      }
+      continue;
+    }
+    if (o.type === "user" && Array.isArray(o.message?.content)) {
+      const ts = tsOf(o.timestamp);
+      if (ts) lastAt = Math.max(lastAt, ts);
+      for (const b of o.message.content) {
+        if (!b || b.type !== "tool_result") continue;
+        const hit = byAction.get(b.tool_use_id || "");
+        if (!hit) continue;
+        const txt = Array.isArray(b.content) ? b.content.map((x) => x.text || "").join(" ") : String(b.content ?? "");
+        const a = hit.action;
+        a.ok = !b.is_error;
+        a.out = clip(txt, 4000);
+        a.err = b.is_error ? clip(txt, 2000) : null;
+        if (ts && a.ts) a.ms = Math.max(0, ts - a.ts);
+        if (!a.ok) hit.round.status = "error";
+      }
+      continue;
+    }
+    if (o.type === "result") {
+      end = {
+        status: o.is_error ? o.subtype || "error" : "ok",
+        result: clip(o.result, 20000),
+        durationMs: Number(o.duration_ms) || 0,
+        turns: Number(o.num_turns) || 0,
+        cost: Number(o.total_cost_usd) || 0,
+      };
+    }
+  }
+
+  // ---- stats（针对全会话）----
+  let actions = 0;
+  let errors = 0;
+  const changed = new Set();
+  for (const r of rounds) {
+    for (const a of r.actions) {
+      actions += 1;
+      if (!a.ok) errors += 1;
+      if (["Edit", "MultiEdit", "Write", "NotebookEdit"].includes(a.tool)) {
+        const p = a.input && (a.input.file_path || a.input.notebook_path || a.input.path);
+        if (p) changed.add(String(p));
+      }
+    }
+  }
+  const stats = {
+    rounds: rounds.length,
+    tools: actions,
+    errors,
+    files: changed.size,
+    filesChanged: [...changed],
+    turns: end ? end.turns : rounds.length,
+    durationMs: end ? end.durationMs : 0,
+    cost: end ? end.cost : 0,
+    lastEventAt: lastAt,
+  };
+
+  // ---- 分页 ----
+  const candidates = before > 0 ? rounds.filter((r) => r.i < before) : rounds;
+  let win = windowSize > 0 ? candidates.slice(-windowSize) : [];
+  let hasMore = candidates.length > win.length;
+
+  // ---- 2 MB 上限：先压输出，再砍老轮 ----
+  const payloadSize = () => Buffer.byteLength(JSON.stringify({ rounds: win, end }), "utf8");
+  for (const limit of [1000, 200]) {
+    if (payloadSize() <= MAX_RESP) break;
+    for (const r of win) {
+      r.think = clip(r.think, limit);
+      for (const a of r.actions) a.out = clip(a.out, limit);
+    }
+  }
+  while (payloadSize() > MAX_RESP && win.length > 1) {
+    win = win.slice(1);
+    hasMore = true;
+  }
+
+  return {
+    dispatch: runId,
+    source,
+    running: !end,
+    truncated: hasMore,
+    hasMore,
+    totalRounds: rounds.length,
+    stats,
+    rounds: win,
+    end,
+    lines: linesFromRounds(win, end),
+  };
+}
+
+export async function readRunSummary(runId) {
+  const r = await readRunRounds(runId, { windowSize: 0 });
+  return r.source === "missing" ? null : r.stats;
+}
+
+function emitRaw(raw, taskId, cur, push) {
+  let o;
+  try {
+    o = JSON.parse(raw);
+  } catch {
+    return;
+  }
+  for (const x of rawLine(o)) {
+    cur.seq += 1;
+    push({ kind: "line", taskId, seq: cur.seq, line: { ...x, seq: cur.seq } });
+  }
+  if (o.type === "result") {
+    push({ kind: "end", taskId, status: o.is_error ? o.subtype || "error" : "ok" });
+  }
+}
+
+export function streamLosflow(req, res, getTargets) {
+  sseHead(res);
+  let closed = false;
+  let busy = false;
+  const state = new Map(); // taskId -> { runId, offset, seq }
+
+  const tick = async () => {
+    if (closed || busy) return;
+    busy = true;
+    try {
+      const targets = (await getTargets()) || [];
+      const ids = new Set(targets.map((t) => String(t.taskId)));
+      for (const id of [...state.keys()]) if (!ids.has(id)) state.delete(id);
+
+      for (const t of targets) {
+        const taskId = String(t.taskId);
+        const runId = String(t.runId || "");
+        if (!runId) continue;
+        const file = streamFile(runId);
+        let cur = state.get(taskId);
+
+        if (!cur || cur.runId !== runId) {
+          // 换了会话：先让前端清空这张卡，再补发尾部
+          cur = { runId, offset: 0, seq: 0 };
+          state.set(taskId, cur);
+          send(res, { kind: "run", taskId, runId, reset: true });
+          let buf = null;
+          try {
+            buf = readFileSync(file);
+          } catch {
+            buf = null;
+          }
+          if (buf && buf.length) {
+            const nl = buf.lastIndexOf(10); // 只吃到最后一个完整行
+            if (nl >= 0) {
+              const complete = buf.subarray(0, nl).toString("utf8");
+              for (const line of complete.split("\n").slice(-300)) {
+                if (line.trim()) emitRaw(line, taskId, cur, (o) => send(res, o));
+              }
+              cur.offset = nl + 1;
+            }
+          }
+          continue;
+        }
+
+        // 增量：只消费完整的行，半行留到下一轮
+        try {
+          const size = statSync(file).size;
+          if (size <= cur.offset) continue;
+          const buf = readFileSync(file);
+          const chunk = buf.subarray(cur.offset).toString("utf8");
+          const nl = chunk.lastIndexOf("\n");
+          if (nl < 0) continue;
+          const complete = chunk.slice(0, nl);
+          cur.offset += Buffer.byteLength(complete + "\n", "utf8");
+          for (const line of complete.split("\n")) {
+            if (line.trim()) emitRaw(line, taskId, cur, (o) => send(res, o));
+          }
+        } catch {
+          /* 文件还没建出来 */
+        }
+      }
+    } catch {
+      /* 一轮失败不影响连接 */
+    }
+    busy = false;
+  };
+
+  const timer = setInterval(tick, 700);
+  tick();
+  req.on("close", () => {
+    closed = true;
+    clearInterval(timer);
+    try { res.end(); } catch { /* already gone */ }
   });
 }
 

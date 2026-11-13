@@ -1,7 +1,8 @@
 // paths.mjs -- LosFlow 的路径解析。默认全部落在仓库内，机器相关的用环境变量覆盖。
 //
 // 约定：
-//   data/        运行时数据（任务表、池子、台账、runs 归档、审批队列）—— 不进 git
+//   data/        运行时数据（任务表、池子、台账、runs 归档、streams 回放归档）—— 不进 git
+//   data/streams 派单结束后的 stream-json 原始回放（默认保留 7 天，随 /api/maintenance/purge 清理）
 //   web/dist     前端构建产物，由本服务托管
 //   server/      后端源码（含 scan-terminals.sh）
 //   agent/       Windows 侧 PowerShell 派单脚本 + wb-bridge
@@ -62,6 +63,8 @@ export function loadPaths() {
   out.wslDistro = env("LOSFLOW_WSL_DISTRO", out.wslDistro);
   out.wslRepo = env("LOSFLOW_WSL_REPO", out.wslRepo);
   out.dashboardPort = Number(env("LOSFLOW_PORT", out.dashboardPort)) || 8899;
+  // stream 回放归档跟着 dataDir 走（测试用 LOSFLOW_DATA 时不会写进真实 data/）
+  out.streamsDir = env("LOSFLOW_STREAMS", join(out.dataDir, "streams"));
   // 兼容旧字段名（原来叫 progressDir / toolsDir，现在统一指向 data）
   out.progressDir = out.dataDir;
   out.toolsDir = out.dataDir;

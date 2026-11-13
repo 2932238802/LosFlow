@@ -44,15 +44,20 @@ body {
 .nav button:hover { color: var(--fg); }
 .nav button.on { color: var(--fg); border-left-color: var(--fg); font-weight: 500; }
 .nav button b { color: var(--dim); font-weight: 400; font-family: var(--mono); font-size: 13px; }
-.side-foot { margin-top: auto; font-family: var(--mono); font-size: 12px; color: var(--dim); letter-spacing: .04em; }
+/* 钉在栏底的次级入口（「已完成」），跟着价钱走 */
+.nav-foot { margin-top: auto; padding-top: 14px; border-top: 1px solid var(--line-soft); }
+.side-foot { margin-top: 14px; font-family: var(--mono); font-size: 12px; color: var(--dim); letter-spacing: .04em; }
 .cost { font-size: 19px; color: var(--mid); margin-top: 12px; font-family: var(--mono); font-weight: 400; }
 .live-line { color: var(--fg); display: flex; align-items: center; gap: 8px; }
-.main { padding: 56px 72px 160px; min-width: 0; max-width: 1080px; }
+.main { padding: 56px 72px 160px; min-width: 0; width: 100%; }
 @media (max-width: 900px) {
   .shell { grid-template-columns: 1fr; }
   .side { position: static; height: auto; border-right: 0; border-bottom: 1px solid var(--line-soft); padding: 22px 18px; }
   .nav { flex-direction: row; flex-wrap: wrap; gap: 4px; }
   .nav button { border-left: 0; border-bottom: 2px solid transparent; padding: 8px 12px; }
+  .nav-foot { margin-top: 0; padding-top: 0; border-top: 0; }
+  .side-foot { margin-top: 10px; display: flex; align-items: baseline; gap: 14px; }
+  .cost { margin-top: 0; }
   .nav button.on { border-left: 0; border-bottom-color: var(--fg); }
   .main { padding: 28px 20px 100px; }
 }
@@ -186,19 +191,11 @@ input:focus, textarea:focus { border-color: var(--dim); }
 .sheet .sect h4 { margin: 0 0 10px; font-size: 13px; font-weight: 500; letter-spacing: .14em; color: var(--muted); text-transform: uppercase; }
 .sheet ul { margin: 0; padding-left: 24px; font-size: 15.5px; font-weight: 300; }
 
-.docframe { width: 100%; height: calc(100vh - 180px); border: 0; background: var(--bg); }
-
 .sel {
   background: #0e0e0e; color: var(--fg); border: 1px solid var(--line); border-radius: 3px;
   font-family: var(--sans); font-size: 14.5px; padding: 12px 14px; outline: none; min-width: 130px;
 }
 .sel:focus { border-color: var(--dim); }
-.points { margin-top: 22px; border-top: 1px solid var(--line-soft); padding-top: 18px; }
-.point { border-bottom: 1px solid var(--line-soft); padding: 12px 0; cursor: pointer; }
-.point:last-child { border-bottom: 0; }
-.point-h { display: flex; align-items: baseline; gap: 10px; font-size: 15.5px; }
-.point-b { margin-top: 10px; font-size: 14.5px; color: var(--mid); display: grid; gap: 6px; padding-left: 18px; border-left: 1px solid var(--line); }
-.point-b b { color: var(--muted); font-weight: 500; margin-right: 8px; font-size: 13px; letter-spacing: .06em; }
 .dirs { margin-top: 12px; max-height: 280px; overflow: auto; border: 1px solid var(--line); border-radius: 3px; }
 .dir { padding: 9px 14px; border-top: 1px solid var(--line-soft); cursor: pointer; font-family: var(--mono); font-size: 13.5px; color: var(--mid); }
 .dir:first-child { border-top: 0; }
@@ -259,3 +256,14 @@ input[type=text], textarea, .sel, .num { border-radius: 9px; background: #101010
 
 /* 最终回执全文 */
 .l-report { color: var(--mid); white-space: pre-wrap; border-top: 1px dashed var(--line-soft); margin-top: 10px; padding-top: 10px; }
+
+/* 三项确认（池子条目） */
+.confirms { display: flex; gap: 18px; flex-wrap: wrap; align-items: center; margin-top: 12px; font-size: 13.5px; color: var(--muted); }
+.confirm { display: inline-flex; align-items: center; gap: 7px; cursor: pointer; user-select: none; }
+.confirm input { accent-color: #8a8a8a; width: 14px; height: 14px; cursor: pointer; }
+.pmeta.live { color: #b9b9b9; }
+
+/* 首屏骨架：state 还没回来时别闪「没有任务 / 池子空了」 */
+.skel { display: grid; gap: 14px; margin-top: 20px; }
+.skel i { display: block; height: 52px; border-radius: 12px; background: linear-gradient(90deg, #101010, #171717, #101010); background-size: 200% 100%; animation: skel 1.2s ease-in-out infinite; }
+@keyframes skel { 0% { background-position: 200% 0 } 100% { background-position: -200% 0 } }

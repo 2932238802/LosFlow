@@ -4,8 +4,9 @@
 // 唯一例外是「终止」：直接杀掉正在跑的那个 bash 进程。
 
 import { spawn } from "node:child_process";
-import { readFileSync, writeFileSync, existsSync, unlinkSync, openSync, closeSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, unlinkSync, openSync, closeSync, copyFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { readJson as readJsonFile, mutate } from "./store.mjs";
 
 let PATHS = null;
 export function initDispatch(paths) {
@@ -27,17 +28,10 @@ function decodeMaybe(buf) {
 
 const runningFile = () => join(PATHS.dataDir, "running.json");
 const tasksFile = () => join(PATHS.dataDir, "Vesta.tasks.json");
+const pendingFile = () => join(PATHS.dataDir, "pending.json");
 
 function readJson(f, d) {
-  try {
-    if (!existsSync(f)) return d;
-    return JSON.parse(readFileSync(f, "utf8"));
-  } catch {
-    return d;
-  }
-}
-function writeJson(f, v) {
-  writeFileSync(f, JSON.stringify(v, null, 2), "utf8");
+  return readJsonFile(f, d);
 }
 
 // 跑一次派单，返回解析后的回执对象
@@ -63,6 +57,9 @@ export function runDispatch({ task, mode = "read", allow = "", repo = "", taskId
     if (mode === "write") args.push("-Mode", "write");
     if (allow) args.push("-Allow", allow);
     if (repo) args.push("-Repo", repo);
+    else if (PATHS.wslRepo) args.push("-Repo", PATHS.wslRepo);
+    if (PATHS.dataDir) args.push("-OutDir", PATHS.dataDir);
+    if (PATHS.wslDistro) args.push("-Distro", PATHS.wslDistro);
     if (taskId) args.push("-TaskId", String(taskId));
     if (cont && !resume) args.push("-Continue");
     if (resume) args.push("-Resume", String(resume));
@@ -89,30 +86,140 @@ export function runDispatch({ task, mode = "read", allow = "", repo = "", taskId
         err = decodeMaybe(readFileSync(errFile));
       } catch { /* ignore */ }
       for (const f of [taskFile, outFile, errFile]) { try { unlinkSync(f); } catch { /* ignore */ } }
+      // 派单结束（成功/失败都算）：把 WSL /tmp 里的 stream-json 抄进 data/streams，
+      // 否则 WSL 重启或 /tmp 被清后，历史会话点开就是空白。
+      const finish = (receipt) => {
+        let runId = receipt && receipt.id ? String(receipt.id) : "";
+        if (!runId) {
+          const live = readJson(runningFile(), null);
+          if (live && live.id && (!taskId || String(live.taskId || "") === String(taskId))) runId = String(live.id);
+        }
+        if (runId) archiveStream(runId);
+        resolve(receipt);
+      };
       const line = out.split("\n").reverse().find((l) => l.trim().startsWith("{"));
-      if (!line) return resolve({ status: "unparsed", error: (err || out).slice(-400) });
+      if (!line) return finish({ status: "unparsed", error: (err || out).slice(-400) });
       try {
-        resolve(JSON.parse(line));
+        finish(JSON.parse(line));
       } catch {
-        resolve({ status: "unparsed", error: "json parse failed" });
+        finish({ status: "unparsed", error: "json parse failed" });
       }
     });
   });
 }
 
-// 终止正在跑的 Claude Code
-export function stopRun() {
-  const run = readJson(runningFile(), null);
-  if (!run || !run.id) return { stopped: false, note: "没有正在跑的派单" };
-  const pidFile = `/tmp/cc-${run.id}.pid`;
+export function archiveStream(runId) {
+  try {
+    const src = `\\\\wsl.localhost\\${PATHS.wslDistro}\\tmp\\cc-${runId}.stream.jsonl`;
+    if (!existsSync(src)) return "";
+    const dir = PATHS.streamsDir || join(PATHS.dataDir, "streams");
+    mkdirSync(dir, { recursive: true });
+    const dest = join(dir, `${runId}.jsonl`);
+    copyFileSync(src, dest);
+    return dest;
+  } catch {
+    return "";
+  }
+}
+
+// 终止一个正在跑的 Claude Code。runId 由调用方按「这条任务实际的活会话」解析后传入；
+// 不传时退回 running.json（全局最后一个），仅用于旧前端兼容。
+export function stopRun(runId = "") {
+  const id = String(runId || (readJson(runningFile(), null)?.id || ""));
+  if (!id) return Promise.resolve({ stopped: false, note: "没有正在跑的派单" });
+  const pidFile = `/tmp/cc-${id}.pid`;
   const cmd = `p=\\$(cat ${pidFile} 2>/dev/null); if [ -n "\\$p" ]; then kill -TERM \\$p 2>/dev/null; sleep 0.5; kill -KILL \\$p 2>/dev/null || true; echo KILLED; else echo NOPID; fi`;
-  const child = spawn("wsl.exe", ["-d", PATHS.wslDistro, "--", "bash", "-lc", cmd]);
-  let out = "";
-  child.stdout.on("data", (d) => (out += d.toString()));
-  child.on("close", () => {
-    /* 结果通过返回值同步不了，下面用同步方式兜底 */
+  return new Promise((resolve) => {
+    const child = spawn("wsl.exe", ["-d", PATHS.wslDistro, "--", "bash", "-lc", cmd], { windowsHide: true });
+    let out = "";
+    let done = false;
+    const finish = (r) => {
+      if (done) return;
+      done = true;
+      resolve(r);
+    };
+    const timer = setTimeout(() => {
+      try { child.kill(); } catch { /* ignore */ }
+      finish({ stopped: true, id, note: `已发送终止信号：${id}（等不到 WSL 回执）` });
+    }, 8000);
+    child.stdout?.on("data", (d) => (out += d.toString()));
+    child.on("error", (e) => {
+      clearTimeout(timer);
+      finish({ stopped: false, id, note: `终止失败：${e.message}` });
+    });
+    child.on("close", () => {
+      clearTimeout(timer);
+      const r = out.trim();
+      finish({
+        stopped: r !== "NOPID",
+        id,
+        note: r === "KILLED" ? `已终止：${id}` : r === "NOPID" ? `没找到进程（可能已自己结束）：${id}` : `已发送终止信号：${id}`,
+      });
+    });
   });
-  return { stopped: true, note: `已发送终止信号：${run.id}` };
+}
+
+// ---- 启动中标记 ----
+// 派单异步化后，「点了按钮 → 子进程真正写 running.json」之间有一段空窗。
+// 这段空窗写进 pending.json，/api/state 据此显示「执行中（启动中）」。
+export async function markStarting(taskId, kind = "dispatch") {
+  const id = String(taskId);
+  await mutate(pendingFile(), (cur) => {
+    const next = cur && typeof cur === "object" && !Array.isArray(cur) ? cur : {};
+    next[id] = { at: Date.now(), kind };
+    return next;
+  });
+}
+
+export function clearStarting(taskId) {
+  const id = String(taskId);
+  return mutate(pendingFile(), (cur) => {
+    const next = cur && typeof cur === "object" && !Array.isArray(cur) ? { ...cur } : {};
+    delete next[id];
+    return next;
+  }).catch(() => undefined);
+}
+
+export function pendingStarts() {
+  const raw = readJson(pendingFile(), {});
+  return raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+}
+
+export function isStarting(taskId) {
+  return Object.prototype.hasOwnProperty.call(pendingStarts(), String(taskId));
+}
+
+// 启动中标记的宽限期（与 buildState 的显示口径一致）：超过就不再认，避免崩过一次后永久卡住
+export async function prunePending(maxAgeMs = 5 * 60 * 1000) {
+  const now = Date.now();
+  await mutate(pendingFile(), (cur) => {
+    if (!cur || typeof cur !== "object" || Array.isArray(cur)) return {};
+    const next = {};
+    let changed = false;
+    for (const [k, v] of Object.entries(cur)) {
+      if (now - Number(v && v.at) < maxAgeMs) next[k] = v;
+      else changed = true;
+    }
+    return changed ? next : cur;
+  }).catch(() => undefined);
+}
+
+// 台账按 taskId 归并成「最近一条」，只读一遍文件。
+export function latestRunsByTask() {
+  const map = {};
+  const ledger = join(PATHS.dataDir, "claude-ledger.jsonl");
+  if (!existsSync(ledger)) return map;
+  try {
+    const lines = readFileSync(ledger, "utf8").split("\n").filter(Boolean);
+    for (const l of lines) {
+      try {
+        const r = JSON.parse(l);
+        const id = String(r.task_id || "");
+        if (id) map[id] = r;
+      } catch { /* skip */ }
+    }
+  } catch { /* skip */ }
+  return map;
 }
 
 // 找出某条任务对应的最近一次派单（用 ledger 里 task 文本模糊匹配）
@@ -152,19 +259,26 @@ export function getTask(id) {
   return readJson(tasksFile(), []).find((x) => String(x.id) === String(id)) || null;
 }
 
-export function deleteTask(id) {
-  const tasks = readJson(tasksFile(), []);
-  const next = tasks.filter((x) => String(x.id) !== String(id));
-  if (next.length === tasks.length) throw new Error("没有这条任务: " + id);
-  writeJson(tasksFile(), next);
-  return { deleted: id };
+export async function deleteTask(id) {
+  const tid = String(id);
+  const next = await mutate(tasksFile(), (tasks) => {
+    const list = Array.isArray(tasks) ? tasks : [];
+    if (!list.some((x) => String(x.id) === tid)) throw new Error("没有这条任务: " + id);
+    return list.filter((x) => String(x.id) !== tid);
+  });
+  return { deleted: tid, left: next.length };
 }
 
-export function setTaskTask(id, patch) {
-  const tasks = readJson(tasksFile(), []);
-  const t = tasks.find((x) => String(x.id) === String(id));
-  if (!t) throw new Error("没有这条任务: " + id);
-  Object.assign(t, patch, { updatedAt: Date.now() });
-  writeJson(tasksFile(), tasks);
-  return t;
+export async function setTaskTask(id, patch) {
+  const tid = String(id);
+  let found = null;
+  await mutate(tasksFile(), (tasks) => {
+    const list = Array.isArray(tasks) ? tasks : [];
+    const t = list.find((x) => String(x.id) === tid);
+    if (!t) throw new Error("没有这条任务: " + id);
+    Object.assign(t, patch, { updatedAt: Date.now() });
+    found = t;
+    return list;
+  });
+  return found;
 }

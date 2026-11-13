@@ -11,7 +11,7 @@
 // POST 一律要求头 `x-dash: 1`：浏览器跨站请求带不上自定义头，等于一个便宜的 CSRF 挡板。
 
 import { createServer } from "node:http";
-import { appendFileSync, openSync, closeSync, unlinkSync } from "node:fs";
+import { appendFileSync, openSync, closeSync, unlinkSync, createReadStream } from "node:fs";
 import { spawn } from "node:child_process";
 import { readFileSync, existsSync, writeFileSync, readdirSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -22,6 +22,7 @@ import * as approvals from "./approvals.mjs";
 import * as events from "./events.mjs";
 import * as dispatch from "./dispatch.mjs";
 import * as docsync from "./docsync.mjs";
+import { mutate } from "./store.mjs";
 import { renderMarkdown, wikiPage } from "./wiki.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -35,7 +36,6 @@ docsync.initDocsync(PATHS);
 
 const FILES = {
   tasks: join(PATHS.dataDir, "Vesta.tasks.json"),
-  progress: join(PATHS.dataDir, "Vesta.json"),
   calls: join(PATHS.dataDir, "calls.jsonl"),
   ledger: join(PATHS.dataDir, "claude-ledger.jsonl"),
 };
@@ -178,7 +178,8 @@ function checkAutoCleanup() {
   try {
     const m = loadMaint();
     const tasks = readJson(FILES.tasks, []) || [];
-    const doneIds = tasks.filter((t) => t.status === "done").map((t) => String(t.id));
+    // 文档同步类任务（docOnly）不算「完成了一条开发任务」，别让它们触发整理
+    const doneIds = tasks.filter((t) => t.status === "done" && !t.docOnly).map((t) => String(t.id));
     const fresh = doneIds.filter((id) => !(m.seenDone || []).includes(id));
     if (fresh.length) {
       m.count = (m.count || 0) + fresh.length;
@@ -186,18 +187,45 @@ function checkAutoCleanup() {
     }
     const threshold = Number(m.threshold);
     if (threshold > 0 && m.count >= threshold) {
-      pool.createTask({
-        title: "整理腾讯文档主表：把已完成/已搁置的行移到归档",
-        owner: "workbuddy",
-        note: cleanupNote(),
-        kind: "company",
-      });
+      // 整理主表是纯文档活：只入 docsync 队列交给 WorkBuddy，不建任务、不进终端
+      docsync.enqueueMaintenance({ note: cleanupNote() }).catch(() => undefined);
       m.count = 0;
       m.lastAt = new Date().toISOString();
     }
     saveMaint(m);
   } catch {
     /* 自动整理失败不影响主流程 */
+  }
+}
+
+// 存量兜底：历史上「写腾讯文档」被建成普通任务（例如 #5）的，补上 docOnly。
+// 任务页 / 终端页不再渲染它，证据仍留在任务表与 /api/state 里可查。
+function markLegacyDocTasks() {
+  try {
+    const tasks = readJson(FILES.tasks, []) || [];
+    let changed = false;
+    for (const t of tasks) {
+      if (t.docOnly) continue;
+      // 只看 WorkBuddy 名下的文档活，避免误伤开发任务
+      if ((t.owner || "") !== "workbuddy") continue;
+      if (!docsync.isDocSyncInstruction([t.subject, t.note].filter(Boolean).join("\n"))) continue;
+      t.docOnly = true;
+      t.docOnlyAt = Date.now();
+      t.updatedAt = Date.now();
+      changed = true;
+    }
+    if (changed) writeFileSync(FILES.tasks, JSON.stringify(tasks, null, 2), "utf8");
+  } catch {
+    /* 回填失败不影响主流程 */
+  }
+}
+
+function assertDispatchable(task) {
+  if (task.docOnly) {
+    throw new Error("这条是腾讯文档同步任务，不派给 Claude Code；写文档走文档同步队列，WorkBuddy 会取走");
+  }
+  if ((task.owner || "") === "workbuddy" && docsync.isDocSyncInstruction([task.subject, task.note].filter(Boolean).join("\n"))) {
+    throw new Error("这条是腾讯文档操作指令，不派给 Claude Code；请走文档同步队列（WorkBuddy 的 next_docsync）");
   }
 }
 
@@ -235,29 +263,7 @@ function saveProjects(list) {
   writeFileSync(join(PATHS.dataDir, "projects.json"), JSON.stringify(list, null, 2), "utf8");
 }
 
-const STAGES = ["基线", "需求", "任务表", "文档", "确认", "开发", "Review", "验收", "收尾"];
-
-function inferStage(tasks, progress, docByTask = {}) {
-  if (!tasks.length) return 1;
-  if (progress && (progress.blocked || progress.status === "waiting")) return null;
-  const doing = tasks.filter((t) => t.status === "doing");
-  if (doing.length) return doing.some((t) => (t.owner || "") === "claude-code") ? 5 : 6;
-  const todo = tasks.filter((t) => t.status === "todo");
-  if (todo.length) {
-    // 异步文档同步回来了 → 台账就绪，阶段条推进到「任务表」；还没回来就停在「需求」
-    const allSynced = todo.every((t) => {
-      const d = docByTask[String(t.id)];
-      return !d || d.status === "done"; // 没有文档同步要求（比如 WB 自己就是文档任务）不算卡点
-    });
-    return allSynced ? 3 : 2;
-  }
-  const open = tasks.filter((t) => t.status !== "done" && t.status !== "blocked");
-  if (!open.length) return 8;
-  return 7;
-}
-
-function wbActivityByTask() {
-  const rows = readJsonl(join(PATHS.dataDir, "calls.jsonl"), 500);
+function wbActivityByTask(rows) {
   const map = {};
   for (const r of rows) {
     const id = String(r.taskId || "");
@@ -272,13 +278,13 @@ function wbActivityByTask() {
 
 // 正在跑的 Claude Code「终端」：WSL 里 /tmp/cc-<id>.pid 还活着的就算一个。
 // running.json 只记最后一个，这里按 pid 文件如实数，能覆盖并发派单。
-let terminalsCache = { at: 0, data: { count: 0, items: [] } };
-// 历史派单产物：tools/runs/*.json 有多少、多大（终端回放和台账都靠它）
-function historyStats() {
+// ok=false 表示这次扫描没成功（WSL 不可用等），此时不要据此判定 running.json 过期。
+let terminalsCache = { at: 0, data: { count: 0, items: [], ok: false } };
+// 历史派单产物：runs/*.json（回执）+ streams/*.jsonl（回放）
+function dirStats(dir) {
   let count = 0;
   let bytes = 0;
   try {
-    const dir = join(PATHS.dataDir, "runs");
     if (existsSync(dir)) {
       for (const f of readdirSync(dir)) {
         try {
@@ -288,23 +294,29 @@ function historyStats() {
       }
     }
   } catch { /* skip */ }
-  return { runs: count, bytes };
+  return { count, bytes };
+}
+
+function historyStats() {
+  const runs = dirStats(join(PATHS.dataDir, "runs"));
+  const streams = dirStats(PATHS.streamsDir || join(PATHS.dataDir, "streams"));
+  return { runs: runs.count, streams: streams.count, bytes: runs.bytes + streams.bytes };
 }
 
 function purgeHistory(hours) {
   const cutoff = Date.now() - hours * 3600 * 1000;
   let runs = 0;
-  try {
-    const dir = join(PATHS.dataDir, "runs");
-    if (existsSync(dir)) {
+  for (const dir of [join(PATHS.dataDir, "runs"), PATHS.streamsDir || join(PATHS.dataDir, "streams")]) {
+    try {
+      if (!existsSync(dir)) continue;
       for (const f of readdirSync(dir)) {
         const p = join(dir, f);
         try {
           if (statSync(p).mtimeMs < cutoff) { unlinkSync(p); runs += 1; }
         } catch { /* skip */ }
       }
-    }
-  } catch { /* skip */ }
+    } catch { /* skip */ }
+  }
   return runs;
 }
 
@@ -323,12 +335,15 @@ function toWslPath(win) {
 }
 const scanScript = () => toWslPath(join(PATHS.serverDir, "scan-terminals.sh"));
 
-async function terminalRuns() {
-  if (Date.now() - terminalsCache.at < 4000) return terminalsCache.data;
+let scanBusy = false;
+let lastScanAt = 0;
+async function scanTerminals() {
   // 走脚本文件，不要内联带引号的命令：wsl.exe 会吃掉内层引号
   let items = [];
+  let ok = false;
   try {
     const r = await runWsl(`bash ${scanScript()}`);
+    ok = r.code === 0;
     items = String(r.out || "")
       .split("\n")
       .map((s) => s.trim())
@@ -343,36 +358,112 @@ async function terminalRuns() {
   } catch {
     items = [];
   }
-  terminalsCache = { at: Date.now(), data: { count: items.length, items } };
+  terminalsCache = { at: Date.now(), data: { count: items.length, items, ok } };
+}
+
+// /api/state 永远读缓存，扫描放后台：5s 轮询不再有 100ms 级的 wsl.exe 尖刺。
+// 首次请求拿到的是空扫描（ok=false，不据此判定 running.json 过期），一两个轮询后补齐。
+function terminalRuns() {
+  if (Date.now() - lastScanAt >= 20000 && !scanBusy) {
+    scanBusy = true;
+    lastScanAt = Date.now();
+    scanTerminals().finally(() => {
+      scanBusy = false;
+    });
+  }
   return terminalsCache.data;
+}
+
+// running.json 由派单脚本写，脚本被强杀/异常退出时可能留下来（显示「执行中」但早已没有进程）。
+// 扫描成功且找不到对应的活 pid、文件又过了宽限期 → 认定过期，删掉，界面自动恢复。
+// 宽限期留着是因为 running.json 先写、WSL 里的 pid 文件后建，别在启动瞬间误判。
+function liveRunning(running, terminals) {
+  if (!running || !running.id) return null;
+  if (!terminals || terminals.ok === false) return running;
+  const alive = (terminals.items || []).some((x) => String(x.id) === String(running.id));
+  if (alive) return running;
+  let age = 0;
+  try { age = Date.now() - statSync(join(PATHS.dataDir, "running.json")).mtimeMs; } catch { age = 0; }
+  if (age < 20000) return running;
+  try { unlinkSync(join(PATHS.dataDir, "running.json")); } catch { /* 删不掉就算了，下次再试 */ }
+  return null;
+}
+
+// 每条任务「实际在跑的 runId」：WSL 里活着的 pid ∩ 台账里该任务最近一条；
+// running.json 兜底（会话刚启动、台账还没落行）。这样并发派单时每张卡都认自己的会话。
+function liveRunByTask(terminals, running) {
+  const live = new Set((terminals?.items || []).map((x) => String(x.id)));
+  const map = {};
+  for (const [taskId, row] of Object.entries(dispatch.latestRunsByTask())) {
+    if (row && live.has(String(row.id))) map[taskId] = String(row.id);
+  }
+  if (running && running.id && running.taskId && (terminals.ok === false || live.has(String(running.id)))) {
+    map[String(running.taskId)] = String(running.id);
+  }
+  return map;
+}
+
+// 终端流要推哪些任务：最多 8 条，正在跑的优先，其次最近更新的。
+// runId 优先 running.json（刚启动、台账还没写），否则台账里该任务最近一条。
+async function streamTargets() {
+  const tasks = readJson(FILES.tasks, []) || [];
+  const terminals = await terminalRuns();
+  const running = readJson(join(PATHS.dataDir, "running.json"), null);
+  const latest = dispatch.latestRunsByTask();
+  const starts = dispatch.pendingStarts();
+  const live = new Set((terminals?.items || []).map((x) => String(x.id)));
+  const isLive = (runId) =>
+    !!runId &&
+    ((running && String(running.id) === runId) || (terminals.ok !== false && live.has(runId)));
+  const out = [];
+  for (const t of tasks) {
+    if (t.docOnly) continue;
+    const id = String(t.id);
+    let runId = "";
+    if (running && String(running.taskId || "") === id && running.id) runId = String(running.id);
+    else if (latest[id] && latest[id].id) runId = String(latest[id].id);
+    if (!runId) continue;
+    out.push({
+      taskId: id,
+      runId,
+      live: isLive(runId),
+      updatedAt: Number(t.updatedAt) || 0,
+      starting: !!starts[id],
+    });
+  }
+  out.sort((a, b) => (b.live ? 1 : 0) - (a.live ? 1 : 0) || b.updatedAt - a.updatedAt);
+  return out.slice(0, 8);
 }
 
 async function buildState() {
   const tasks = readJson(FILES.tasks, []) || [];
-  const progress = readJson(FILES.progress, {}) || {};
-  const calls = readJsonl(FILES.calls, 40);
-  const wbMap = wbActivityByTask();
+  const callRows = readJsonl(FILES.calls, 500);
+  const wbMap = wbActivityByTask(callRows);
   const ledger = readJsonl(FILES.ledger, 200);
   const runMap = {};
   for (const r of ledger) {
     const id = String(r.task_id || "");
     if (!id) continue;
-    runMap[id] = { id: r.id || "", at: r.at || "", status: r.status || "", cost: Number(r.cost_usd || 0) };
+    // 列表里只带轻量字段；回执全文（result）走 /api/task/run，别把 state 撑大
+    runMap[id] = {
+      id: r.id || "",
+      at: r.at || "",
+      status: r.status || "",
+      cost: Number(r.cost_usd || 0),
+      turns: Number(r.turns || 0),
+    };
   }
   const doc = docsync.summary();
   const terminals = await terminalRuns();
   const history = historyStats();
+  // 残留的 running.json 会让「标记完成」按钮一直禁用：只认 WSL 里确实活着的会话
+  const running = liveRunning(readJson(join(PATHS.dataDir, "running.json"), null), terminals);
+  const liveRuns = liveRunByTask(terminals, running);
+  const starts = dispatch.pendingStarts();
+  const nowMs = Date.now();
   return {
     now: new Date().toISOString(),
-    stage: inferStage(tasks, progress, doc.byTask),
-    stages: STAGES,
-    progress: {
-      status: progress.status || "",
-      updated: progress.updated || "",
-      blocked: progress.blocked || "",
-      decision: progress.decision || "",
-    },
-    running: readJson(join(PATHS.dataDir, "running.json"), null),
+    running,
     projects: loadProjects(),
     maintenance: loadMaint(),
     pool: pool.loadPool(),
@@ -381,32 +472,41 @@ async function buildState() {
     history,
     approvals: approvals.loadApprovals().slice(-20).reverse(),
     allowlist: approvals.loadAllowlist(),
-    tasks: tasks.map((t) => ({
-      id: String(t.id),
-      subject: t.subject || "",
-      owner: t.owner || "",
-      status: t.status || "",
-      evidence: t.evidence || "",
-      note: t.note || "",
-      repo: t.repo || "",
-      kind: t.kind || "personal",
-      wb: wbMap[String(t.id)] || null,
-      updatedAt: t.updatedAt || null,
-      sessionId: t.sessionId || "",
-      nudgedAt: t.nudgedAt || "",
-      nudges: t.nudges || 0,
-      docSync: doc.byTask[String(t.id)] || null,
-      run: runMap[String(t.id)] || null,
-    })),
-    calls: calls
+    tasks: tasks.map((t) => {
+      const id = String(t.id);
+      const st = starts[id];
+      // 启动中超过 5 分钟视为残留（脚本异常退出、没来得及清）——前端不再显示「启动中」
+      const starting = st && nowMs - Number(st.at || 0) < 5 * 60 * 1000 ? { at: st.at, kind: st.kind || "dispatch" } : null;
+      return {
+        id,
+        subject: t.subject || "",
+        owner: t.owner || "",
+        status: t.status || "",
+        evidence: t.evidence || "",
+        note: t.note || "",
+        repo: t.repo || "",
+        kind: t.kind || "personal",
+        // 文档同步类任务：只走 docsync 队列 → WorkBuddy，不进任务页 / 终端页
+        docOnly: !!t.docOnly,
+        // 人工验收时标注的「类型 / 区域 / 完成时间」（旧任务没有这些字段，缺省为空）
+        workType: t.workType || "",
+        area: t.area || null,
+        finishedAt: t.finishedAt || null,
+        wb: wbMap[id] || null,
+        updatedAt: t.updatedAt || null,
+        sessionId: t.sessionId || "",
+        nudgedAt: t.nudgedAt || "",
+        nudges: t.nudges || 0,
+        docSync: doc.byTask[id] || null,
+        starting,
+        running: liveRuns[id] || null,
+        run: runMap[id] || null,
+      };
+    }),
+    calls: callRows
       .filter((c) => c.kind === "tool")
-      .map((c) => ({ at: c.at, tool: c.tool, ok: c.ok, args: c.args }))
       .slice(-12)
       .reverse(),
-    dispatches: ledger
-      .slice(-10)
-      .reverse()
-      .map((r) => ({ at: r.at, status: r.status, cost: r.cost_usd, resumed: !!r.resumed_from, task: (r.task_preview || "").slice(0, 70) })),
     spendToday: todaySpend(ledger),
   };
 }
@@ -441,6 +541,36 @@ function readBody(req) {
     });
     req.on("error", reject);
   });
+}
+
+// 投递型派单：写「启动中」标记 → 立刻返回 → 后台跑。
+// 注意：后台链路必须兜住所有异常，否则 unhandledRejection 会让 Node 直接退出。
+async function startDispatch(b, cont) {
+  const task = dispatch.getTask(b.id);
+  if (!task) throw new Error("没有这条任务");
+  assertDispatchable(task);
+  if (cont && !task.sessionId) throw new Error("这条任务还没有自己的会话，先点「执行」开一个");
+  if (dispatch.isStarting(b.id)) throw new Error("这条正在启动中，稍等（别连点，会重复花费）");
+  await dispatch.markStarting(b.id, cont ? "continue" : "dispatch");
+  const run = {
+    task: b.task || task.note || task.subject,
+    mode: cont ? "read" : b.mode === "write" ? "write" : "read",
+    allow: b.allow || "",
+    repo: task.repo,
+    taskId: b.id,
+    resume: task.sessionId || "",
+  };
+  setImmediate(() => {
+    dispatch
+      .runDispatch(run)
+      .then(async (r) => {
+        if (r && r.session_id) await dispatch.setTaskTask(b.id, { sessionId: r.session_id });
+        syncBrain(b.id, task.subject, r);
+      })
+      .catch((err) => syncBrain(b.id, task.subject, { status: "failed", error: err.message }))
+      .finally(() => dispatch.clearStarting(b.id));
+  });
+  return { started: true, taskId: String(b.id) };
 }
 
 const ROUTES = {
@@ -480,7 +610,7 @@ const ROUTES = {
     saveMaint(m);
     return { maintenance: m };
   },
-  "/api/maintenance/cleanup": (b) => {
+  "/api/maintenance/cleanup": async (b) => {
     const docUrl = b.docUrl || "https://docs.qq.com/sheet/DZVFSeURwdmVJdVZL?tab=BB08J2";
     const note = [
       `文档 ${docUrl} 的主表（tab BB08J2）。`,
@@ -492,26 +622,31 @@ const ROUTES = {
       "4) 用 report_task 回填：移了几行、主表剩几行、归档现有几行、读回校验结果。",
       "做不到就回填 blocked，写清卡在哪一步 + 报错原文。",
     ].join("\n");
-    const t = pool.createTask({ title: "整理腾讯文档主表：把已完成/已搁置的行移到归档", owner: "workbuddy", note, kind: "company" });
-    return { task: t };
+    // 整理主表是纯文档活：入 docsync 队列等 WorkBuddy 取走，不建任务行
+    const job = await docsync.enqueueMaintenance({ note, docUrl });
+    return { docsync: job };
   },
   // 推入 = 两条线：任务本体立刻落库可开工；文档那一行进异步队列（docsync）。
   // 接口不等任何一边：三项确认里授权打勾 → 后台自动派给工作 Agent；否则只等你去点「执行」。
   "/api/pool/push": async (b) => {
-    const out = pool.pushPool({ id: b.id, priority: b.priority });
+    const out = await pool.pushPool({ id: b.id, priority: b.priority });
     const auth = !!(out.item.confirm && out.item.confirm.auth);
     const autoStarted = [];
     for (const t of out.created) {
       if ((t.owner || "claude-code") !== "claude-code" || !auth) continue;
+      // 兜底：池子里混进文档操作指令时不自动派给 Claude Code
+      if (docsync.isDocSyncInstruction([t.subject, t.note].filter(Boolean).join("\n"))) continue;
       autoStarted.push(String(t.id));
+      await dispatch.markStarting(t.id, "push");
       setImmediate(() => {
         dispatch
           .runDispatch({ task: t.note || t.subject, mode: "read", repo: t.repo, taskId: t.id })
-          .then((r) => {
-            if (r && r.session_id) dispatch.setTaskTask(t.id, { sessionId: r.session_id });
+          .then(async (r) => {
+            if (r && r.session_id) await dispatch.setTaskTask(t.id, { sessionId: r.session_id });
             syncBrain(t.id, t.subject, r);
           })
-          .catch((err) => syncBrain(t.id, t.subject, { status: "failed", error: err.message }));
+          .catch((err) => syncBrain(t.id, t.subject, { status: "failed", error: err.message }))
+          .finally(() => dispatch.clearStarting(t.id));
       });
     }
     return { item: out.item, created: out.created, docsync: out.docsync, autoStarted };
@@ -525,7 +660,15 @@ const ROUTES = {
     return { hours, runs, wsl, left: historyStats() };
   },
   "/api/pool/remove": (b) => pool.removePool(b.id),
-  "/api/run/stop": () => dispatch.stopRun(),
+  // 终止只作用于「这张卡自己的会话」：前端带上 taskId，服务端按活进程反查 runId。
+  // 不带 taskId 的旧前端仍按 running.json 的全局那条处理（留一个版本兼容）。
+  "/api/run/stop": async (b) => {
+    const taskId = String(b.taskId || "").trim();
+    if (!taskId) return dispatch.stopRun();
+    const hit = (await streamTargets()).find((x) => x.taskId === taskId && x.live);
+    if (!hit) return { stopped: false, note: "这条不在跑（可能已结束或换了会话）" };
+    return dispatch.stopRun(hit.runId);
+  },
   // 删掉单条历史会话：WSL /tmp 产物 + runs 归档 + 台账行 + 任务上的会话指针
   "/api/run/delete": async (b) => {
     const id = String(b.id || "").trim();
@@ -564,50 +707,25 @@ const ROUTES = {
     let clearedTasks = 0;
     if (session || b.taskId) {
       try {
-        const tasks = readJson(FILES.tasks, []) || [];
-        let changed = false;
-        for (const t of tasks) {
-          const hitSession = session && String(t.sessionId || "") === session;
-          // 这个任务已经没有别的派单记录了 → 指针一并不留（之后再跑就是新会话）
-          const hitTask = b.taskId && String(t.id) === String(b.taskId) && !keepTasks.has(String(b.taskId));
-          if (hitSession || hitTask) { t.sessionId = ""; t.updatedAt = Date.now(); changed = true; clearedTasks += 1; }
-        }
-        if (changed) writeFileSync(FILES.tasks, JSON.stringify(tasks, null, 2), "utf8");
+        await mutate(FILES.tasks, (cur) => {
+          const tasks = Array.isArray(cur) ? cur : [];
+          let changed = false;
+          for (const t of tasks) {
+            const hitSession = session && String(t.sessionId || "") === session;
+            // 这个任务已经没有别的派单记录了 → 指针一并不留（之后再跑就是新会话）
+            const hitTask = b.taskId && String(t.id) === String(b.taskId) && !keepTasks.has(String(b.taskId));
+            if (hitSession || hitTask) { t.sessionId = ""; t.updatedAt = Date.now(); changed = true; clearedTasks += 1; }
+          }
+          return changed ? tasks : undefined;
+        });
       } catch { /* skip */ }
     }
     return { id, wslFiles, ledgerRemoved, removedRun, clearedTasks };
   },
-  "/api/task/continue": async (b) => {
-    const task = dispatch.getTask(b.id);
-    if (!task) throw new Error("没有这条任务");
-    if (!task.sessionId) throw new Error("这条任务还没有自己的会话，先点「执行」开一个");
-    const r = await dispatch.runDispatch({
-      task: b.task || task.note || task.subject,
-      mode: "read",
-      repo: task.repo,
-      taskId: b.id,
-      resume: task.sessionId,
-    });
-    if (r && r.session_id) dispatch.setTaskTask(b.id, { sessionId: r.session_id });
-    syncBrain(b.id, task.subject, r);
-    return { dispatch: r, session: r && r.session_id };
-  },
-  "/api/task/dispatch": async (b) => {
-    const task = dispatch.getTask(b.id);
-    if (!task) throw new Error("没有这条任务");
-    // 每条任务一条独立会话：有就续接它自己的，没有就开新的
-    const r = await dispatch.runDispatch({
-      task: b.task || task.note || task.subject,
-      mode: b.mode === "write" ? "write" : "read",
-      allow: b.allow || "",
-      repo: task.repo,
-      taskId: b.id,
-      resume: task.sessionId || "",
-    });
-    if (r && r.session_id) dispatch.setTaskTask(b.id, { sessionId: r.session_id });
-    syncBrain(b.id, task.subject, r);
-    return { dispatch: r, session: r && r.session_id };
-  },
+  // 投递型接口：只保证「已经开始」，不阻塞到子进程结束（一次派单最长 600 秒）。
+  // 立刻返回 {started, taskId}，后台跑完再写回执 / sessionId / 台账。
+  "/api/task/continue": (b) => startDispatch(b, true),
+  "/api/task/dispatch": (b) => startDispatch(b, false),
   "/api/projects/add": (b) => {
     const name = String(b.name || "").trim();
     const path = String(b.path || "").trim();
@@ -623,33 +741,13 @@ const ROUTES = {
     saveProjects(list);
     return { projects: list };
   },
-  "/api/task/explore": async (b) => {
-    const task = dispatch.getTask(b.id);
-    if (!task) throw new Error("没有这条任务");
-    const prompt = [
-      "这是一个探索任务：不要改任何代码。",
-      `目标：${task.subject}`,
-      task.note ? `补充：${task.note}` : "",
-      "请先读相关代码与文档，找出可优化点（3-8 条），只输出严格 JSON：",
-      '{"points":[{"title":"一句话结论","current":"现状","reason":"为什么是问题","gain":"预计提升（可量化就量化）","detail":"怎么做，2-3句","effort":"小/中/大"}]}',
-      "不要解释、不要代码块，不要给与优化无关的建议。",
-    ].filter(Boolean).join("\n");
-    const r = await dispatch.runDispatch({
-      task: prompt,
-      mode: "read",
-      repo: task.repo,
-      taskId: b.id,
-      budget: 0.4,
-    });
-    return { dispatch: r, raw: r.result || "" };
-  },
-  "/api/task/nudge": (b) => {
+  "/api/task/nudge": async (b) => {
     const task = dispatch.getTask(b.id);
     if (!task) throw new Error("没有这条任务");
     const now = new Date();
     const p2 = (n) => String(n).padStart(2, "0");
     const stamp = `${now.getFullYear()}-${p2(now.getMonth() + 1)}-${p2(now.getDate())} ${p2(now.getHours())}:${p2(now.getMinutes())}`;
-    dispatch.setTaskTask(b.id, {
+    await dispatch.setTaskTask(b.id, {
       nudgedAt: stamp,
       nudges: (Number(task.nudges) || 0) + 1,
       status: task.status === "done" ? task.status : "todo",
@@ -664,19 +762,62 @@ const ROUTES = {
     return { text, nudgedAt: stamp, nudges: (Number(task.nudges) || 0) + 1 };
   },
   "/api/task/note": (b) => dispatch.setTaskTask(b.id, { note: String(b.note || "") }),
+  // 人工验收：回执 ok 只说明 Claude 跑完了，不等于任务做对了。
+  // 人核对后在终端里「标记完成」，顺手标注类型（开发/review/Plan）与区域（代码区/文档区）。
+  "/api/task/status": async (b) => {
+    const task = dispatch.getTask(b.id);
+    if (!task) throw new Error("没有这条任务");
+    const status = String(b.status || "");
+    if (status === "done") {
+      const workType = ["dev", "review", "plan"].includes(b.workType) ? b.workType : "dev";
+      const raw = b.area && typeof b.area === "object" ? b.area : {};
+      const kind = raw.kind === "docs" ? "docs" : "code";
+      // 代码区默认任务卡上的 repo；文档区必须由人指定路径
+      const path = String(raw.path || "").trim() || (kind === "code" ? String(task.repo || "") : "");
+      if (kind === "docs" && !path) throw new Error("文档区要指定路径");
+      const evidence = String(b.evidence || "").trim() || String(task.evidence || "");
+      const t = await dispatch.setTaskTask(b.id, {
+        status: "done",
+        workType,
+        area: { kind, path },
+        evidence,
+        finishedAt: Date.now(),
+      });
+      // 回填腾讯文档：一条 update-row（类型 + 区域），WorkBuddy 取到后改状态与备注
+      await docsync.enqueueBackfill({ taskId: b.id, subject: t.subject, workType, area: t.area });
+      checkAutoCleanup();
+      return { task: t };
+    }
+    if (status === "todo") {
+      // 标错了就重新打开：证据、类型、区域都留着，方便再次标记
+      return { task: await dispatch.setTaskTask(b.id, { status: "todo", finishedAt: null }) };
+    }
+    throw new Error("status 只能是 done 或 todo");
+  },
   "/api/task/delete": (b) => dispatch.deleteTask(b.id),
   "/api/prompt/optimize": async (b) => {
     const text = (b.text || "").trim();
     if (!text) throw new Error("提示词为空");
+    // 「优化提示词 SKILL」里存的就是这段系统提示；以前存了没人读，改模板等于没改。
+    const systemText = String(loadTemplates().optimizeSystem || "").trim();
     const prompt = [
-      "把下面这段需求改写成一条能直接交给 Claude Code 执行的派单指令。",
-      "要求：只用一段话；说清 做什么 / 照哪做（给路径或文档，不要贴全文）/ 怎么验（具体命令）/ 要回执。",
-      "不要解释、不要客套、不要代码块，直接输出改写后的指令。",
+      systemText || "你是提示词优化助手。",
+      "把用户草稿改写成一条可直接交给 Claude Code 执行的派单指令，只用一段话，必须包含四要素：",
+      "1) 做什么；2) 照哪做（只给路径或文档名，不要贴全文）；3) 怎么验（具体命令）；4) 要什么回执。",
+      "保持原意、不要新增需求；信息不足时按仓库约定补全（AGENTS.md / docs/），不要反问用户。",
+      "只输出改写后的指令，不要解释、不要客套、不要 Markdown 代码块。",
       "",
+      "草稿：",
       text,
     ].join("\n");
     const r = await dispatch.runDispatch({ task: prompt, mode: "read", taskId: b.taskId });
-    return { prompt: (r.result || "").trim(), status: r.status, cost: r.cost_usd };
+    const out = String(r.result || "").trim();
+    // 失败时别把原文当结果返回：前端会误报「已优化」，看起来就是点了没反应。
+    if (!out) {
+      const why = r.error || r.stderr || `status=${r.status || "unknown"}`;
+      throw new Error("优化失败：" + String(why).slice(0, 300));
+    }
+    return { prompt: out, status: r.status, cost: r.cost_usd };
   },
   "/api/task/repo": (b) => dispatch.setTaskTask(b.id, { repo: b.repo }),
   "/api/task/docs": async (b) => {
@@ -762,8 +903,46 @@ const server = createServer(async (req, res) => {
       const row = dispatch.latestDispatchFor(id);
       dispatchId = row && row.id;
     }
-    if (!dispatchId) return sendJson(res, 200, { dispatch: null, lines: [] });
+    if (!dispatchId) return sendJson(res, 200, { dispatch: null, lines: [], rounds: [], source: "missing" });
+
+    // v=2：轮 + 动作契约（6 号方案）。旧前端不带 v 仍走原来的平铺行。
+    if (url.searchParams.get("v") === "2") {
+      const before = Number(url.searchParams.get("before") || 0) || 0;
+      try {
+        const data = await events.readRunRounds(dispatchId, { before });
+        return sendJson(res, 200, {
+          ...data,
+          dispatch: dispatchId,
+          running: !!(run && run.id === dispatchId) || data.running,
+        });
+      } catch (err) {
+        return sendJson(res, 200, { dispatch: dispatchId, source: "missing", rounds: [], lines: [], error: err.message });
+      }
+    }
+
     return sendJson(res, 200, { dispatch: dispatchId, running: !!(run && run.id === dispatchId), lines: events.readRunRaw(dispatchId) });
+  }
+
+  // 原始 stream-json 下载（不做任何解析，排查用）
+  if (req.method === "GET" && url.pathname === "/api/task/stream") {
+    const id = url.searchParams.get("id");
+    const run = readJson(join(PATHS.dataDir, "running.json"), null);
+    let dispatchId = run && String(run.taskId || "") === String(id) ? run.id : null;
+    if (!dispatchId) {
+      const row = dispatch.latestDispatchFor(id);
+      dispatchId = row && row.id;
+    }
+    dispatchId = dispatchId || String(url.searchParams.get("run") || "");
+    if (!dispatchId) return sendJson(res, 404, { error: "没有这条会话" });
+    const { file } = events.resolveRunFile(dispatchId);
+    if (!file) return sendJson(res, 404, { error: "这条会话的原始流已不在（WSL /tmp 已清）" });
+    res.writeHead(200, {
+      "content-type": "application/x-ndjson; charset=utf-8",
+      "content-disposition": `attachment; filename="${dispatchId}.jsonl"`,
+      "cache-control": "no-store",
+    });
+    createReadStream(file).pipe(res);
+    return;
   }
 
   if (req.method === "GET" && url.pathname === "/api/task/log") {
@@ -782,7 +961,34 @@ const server = createServer(async (req, res) => {
       events: events.readRunEvents(row.id),
     });
   }
+  if (req.method === "GET" && url.pathname === "/api/task/run") {
+    // 回执全文单独取：/api/state 的 tasks[].run 只带轻量字段，别把列表撑大
+    const id = url.searchParams.get("id");
+    const row = dispatch.latestDispatchFor(id);
+    if (!row) return sendJson(res, 200, { run: null, summary: null });
+    // 规则摘要（改了 N 个文件 / N 个错误）供「标记完成」预填证据，读流不在 HTTP 线程里整包解析
+    let summary = null;
+    try {
+      summary = await events.readRunSummary(row.id);
+    } catch {
+      summary = null;
+    }
+    return sendJson(res, 200, {
+      run: {
+        id: row.id || "",
+        at: row.at || "",
+        status: row.status || "",
+        cost: Number(row.cost_usd || 0),
+        turns: Number(row.turns || 0),
+        session: row.session_id || "",
+        result: String(row.result || "").slice(0, 4000),
+      },
+      summary,
+    });
+  }
+
   if (req.method === "GET" && url.pathname === "/events/claude") return events.streamClaude(req, res);
+  if (req.method === "GET" && url.pathname === "/events/losflow") return events.streamLosflow(req, res, streamTargets);
   if (req.method === "GET" && url.pathname === "/events/workbuddy") return events.streamWorkbuddy(req, res);
 
   if (req.method === "GET" && url.pathname === "/api/state") {
@@ -828,20 +1034,17 @@ const server = createServer(async (req, res) => {
     }
   }
   if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
-    try {
-      const html = readFileSync(join(HERE, "index.html"), "utf8");
-      res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
-      return res.end(html);
-    } catch (err) {
-      res.writeHead(500, { "content-type": "text/plain; charset=utf-8" });
-      return res.end("index.html missing: " + err.message);
-    }
+    // 早期 FLOW 原型页（server/index.html）已废弃，不再托管；统一进驾驶舱
+    res.writeHead(302, { location: "/app/" });
+    return res.end();
   }
 
   res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
   res.end("not found");
 });
 
+markLegacyDocTasks();
+dispatch.prunePending();
 setInterval(checkAutoCleanup, 60000);
 checkAutoCleanup();
 

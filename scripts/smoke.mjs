@@ -3,6 +3,7 @@
 import { spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import * as docsync from "../server/docsync.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const port = process.env.SMOKE_PORT || "8911";
@@ -34,8 +35,12 @@ try {
   for (let i = 0; i < 40 && !boot.includes("http://"); i += 1) await sleep(250);
 
   const state = await get("/api/state");
-  check("GET /api/state", !!state && typeof state.stage !== "undefined", `stage=${state.stage}`);
+  check("GET /api/state", !!state && !!state.now, `now=${state.now}`);
   check("state.tasks 是数组", Array.isArray(state.tasks), `${state.tasks?.length ?? "?"} 条`);
+  check("state.tasks 带 docOnly 字段", (state.tasks || []).every((t) => typeof t.docOnly === "boolean"));
+  check("state.tasks 带 starting / running 字段", (state.tasks || []).every((t) => "starting" in t && "running" in t));
+  check("state 不再带 stage / dispatches", !("stage" in state) && !("dispatches" in state) && !("stages" in state));
+  check("state.tasks[].run 不带回执全文", (state.tasks || []).every((t) => !t.run || !("result" in t.run)));
   check("state.docsync 存在", !!state.docsync, `pending=${state.docsync?.pending}`);
   check("state.terminals 存在", !!state.terminals, `count=${state.terminals?.count}`);
   check("state.history 存在", !!state.history, `runs=${state.history?.runs}`);
@@ -43,8 +48,57 @@ try {
   const doc = await get("/api/docsync");
   check("GET /api/docsync", typeof doc.pending === "number");
 
+  // 回执全文单独取（列表轻量化）
+  const rawTask = (state.tasks || [])[0];
+  if (rawTask) {
+    const run = await get(`/api/task/run?id=${encodeURIComponent(rawTask.id)}`);
+    check("GET /api/task/run", !!run && "run" in run, rawTask.id);
+  }
+
+  // 6 号契约：轮 + 动作（找一个有台账会话的任务）
+  const runTask = (state.tasks || []).find((t) => t.run && t.run.id);
+  if (runTask) {
+    const v2 = await get(`/api/task/raw?id=${encodeURIComponent(runTask.id)}&v=2`);
+    check(
+      "GET /api/task/raw?v=2 轮契约",
+      Array.isArray(v2.rounds) && typeof v2.totalRounds === "number" && !!v2.source,
+      `source=${v2.source} rounds=${v2.totalRounds}`
+    );
+    const dl = await fetch(`${base}/api/task/stream?id=${encodeURIComponent(runTask.id)}`);
+    check("GET /api/task/stream", [200, 404].includes(dl.status), `HTTP ${dl.status}`);
+    try { await dl.body?.cancel(); } catch { /* ignore */ }
+  } else {
+    console.log("· 跳过 v=2 / stream 检查（当前没有带台账的任务）");
+  }
+  check("history 含 streams 计数", typeof state.history?.streams === "number", `streams=${state.history?.streams}`);
+
+  // 终端流：一条多路复用 SSE（连上就断，不读完整流）
+  const sse = await fetch(base + "/events/losflow", { headers: { "x-dash": "1" } });
+  check("GET /events/losflow 是 SSE", sse.ok && (sse.headers.get("content-type") || "").includes("text/event-stream"));
+  try { await sse.body?.cancel(); } catch { /* ignore */ }
+
+  // 文档指令判定：命中追加/回填/整理 → 文档活；普通开发任务不误伤
+  check("文档指令判定：追加一行", docsync.isDocSyncInstruction("在腾讯文档任务表追加一行：版本号同步"));
+  check("文档指令判定：整理主表", docsync.isDocSyncInstruction("整理腾讯文档主表：把已完成的行移到归档"));
+  check("文档指令判定：普通任务不误伤", !docsync.isDocSyncInstruction("Fix questionnaire skip logic"));
+
+  // 存量 docOnly（例如历史 #5）必须挡在派单入口外；没有就不测
+  const docTask = (state.tasks || []).find((t) => t.docOnly);
+  if (docTask) {
+    const r = await fetch(base + "/api/task/dispatch", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-dash": "1" },
+      body: JSON.stringify({ id: docTask.id }),
+    });
+    const j = await r.json().catch(() => ({}));
+    check("docOnly 任务不派 Claude Code", r.status === 400, `#${docTask.id} HTTP ${r.status} ${j.error || ""}`);
+  }
+
   const app = await fetch(base + "/app/");
   check("GET /app/（前端已构建）", app.ok, `HTTP ${app.status}`);
+
+  const root = await fetch(base + "/", { redirect: "manual" });
+  check("GET / 跳 /app/", root.status === 302 && root.headers.get("location") === "/app/", `HTTP ${root.status}`);
 
   const wiki = await fetch(base + "/wiki");
   check("GET /wiki", wiki.ok, `HTTP ${wiki.status}`);

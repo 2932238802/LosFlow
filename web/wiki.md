@@ -58,8 +58,8 @@ Claude Code 想执行但被权限拦住时，这里会出现它想跑的命令 +
 | 页面元素 | 数据源 | 实时性 |
 | --- | --- | --- |
 | 任务池 / 任务 / 授权 | `D:\PROJECT\Ds\_progress\*.json` | 5 秒轮询 |
-| Claude Code 执行日志 | WSL `/tmp/cc-<id>.stream.jsonl`（stream-json 事件） | 1.5 秒轮询，只在展开时 |
-| 正在跑哪条 | `_progress/running.json`（派单开始写、结束删） | 1.5 秒 |
+| Claude Code 执行日志 | WSL `/tmp/cc-<id>.stream.jsonl`（stream-json 事件） | 实时（`/events/losflow` 增量推，逐行出现） |
+| 正在跑哪条 | `_progress/running.json` + 台账 ∩ WSL 活进程 | 实时（每张卡认自己的会话） |
 | WorkBuddy 阶段 | `tools/wb-bridge/calls.jsonl`（next_task / report_task 带 taskId） | 5 秒 |
 | 今日花费 | `tools/claude-ledger.jsonl` 累加 | 5 秒 |
 
@@ -78,10 +78,22 @@ Claude Code 想执行但被权限拦住时，这里会出现它想跑的命令 +
 ```
 
 - 队列文件：`_progress/docsync.json`
+- **动作**：`append-row`（推入时写一行「开发中」）、`update-row`（标记完成时回填状态/备注）、`cleanup`（整理主表：已完成/已搁置移到「归档」）。维护动作同样只入队，不建任务行。
+- **写文档不占任务行**：点「整理主表」或自动整理到阈值，都只往 `docsync` 入队（`action:"cleanup"`），任务池 / 任务页 / 会话页都不出现条目；`taskboard.ps1 -Add` 与 wb-bridge `add_task` 传腾讯文档操作指令会被拒建，提示走本队列。
 - **回调 done 之后**：任务表里该条打上 `docSyncedAt`，面板上任务卡进度条 `10% → 30%`（台账就绪，等开工），全局阶段条 `② 需求 → ③ 任务表`；没有文档同步要求的任务（WB 自己的文档活）不算卡点。
 - 面板接口：`GET /api/docsync`（只读摘要）；回调 `POST /api/docsync/report`（带 `x-dash: 1`）
-- MCP 工具：`next_docsync`（取一条，标 running）、`report_docsync`（done / failed）
+- MCP 工具：`next_docsync`（取一条，标 running）、`report_docsync`（done / failed）；`add_task` 收到文档操作指令会拒建（该走队列）。
 - **WorkBuddy 侧要建一个 10–30 分钟的定时任务**：`next_docsync` → 有活就写 → `report_docsync`。没建就会一直排队，但**不影响任何任务开工**。
+
+## 三·六、人验收：会话里的「标记完成」
+
+回执 `ok` 只说明 Claude 跑完了，不说明它改对了地方。任务状态由人在「会话」页推进，不靠猜回执：
+
+- 跑完核对后在会话详情点「**标记完成**」：选类型（开发 / review / Plan）、区域（代码区 / 文档区，文档区可逐级选路径），证据预填最后一次回执（状态 + 轮次 + 花费 + 结论摘要）。
+- 确认后任务表写入 `status=done / workType / area / evidence / finishedAt`；任务进「已完成」，全部完成时阶段条到 ⑧，自动整理计数 +1。
+- 同时入队一条 `update-row` 文档同步：WorkBuddy 在主表按任务名找到那一行，改「任务状态=已完成」+ 备注（类型 + 区域）；找不到就按追加一行处理。
+- 标错了点「**重新打开**」：回 `todo`，证据和上次回执都保留。
+- 接口：`POST /api/task/status { id, status: "done" | "todo", workType?, area?, evidence? }`。
 
 ## 四、卡住了先看哪
 
@@ -89,6 +101,7 @@ Claude Code 想执行但被权限拦住时，这里会出现它想跑的命令 +
 | --- | --- | --- |
 | 推入了但一直显示 `文档同步排队中` | WorkBuddy 侧的定时任务建了没 | 去 WorkBuddy 建 10–30 分钟轮询 `next_docsync` |
 | 任务推入后一直 `待派单` | 三项确认里的「授权」没打勾（不会自动开工） | 点「执行」，或补打勾再推 |
+| 会话跑完了但任务还是 `待派单` | 这是设计如此（回执 ≠ 完成） | 去「会话」页点「标记完成」，选类型与区域 |
 | 卡片一直「执行中」但日志不动 | `running.json` 是不是残留 | 点「终止」 |
 | 派单报错 / 结果为空 | 台账最后一条的 status 和 denials | 看 `claude-ledger.jsonl` |
 | 授权队列里有东西 | 命令原文是否合理 | 批准或拒绝，拒绝不会重派 |

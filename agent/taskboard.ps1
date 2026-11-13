@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Canonical task list for a run, with an export in WorkBuddy's TodoWrite shape.
 
@@ -19,6 +19,8 @@
 
 .PARAMETER Add
     Add a task by title. Optional -Owner and -Note.
+    Tencent-docs write instructions are rejected: that work goes through the docsync queue
+    (wb-bridge next_docsync / report_docsync), never a task row.
 
 .PARAMETER Set
     Task id to update. Requires -Status. Optional -Evidence, -Owner, -Note.
@@ -78,6 +80,14 @@ function Save-Tasks {
 }
 
 if ($Add) {
+    # 写腾讯文档是默认后台行为：只走 docsync 队列 → WorkBuddy，不占任务表、不进终端。
+    # 传进来的如果是文档操作指令，直接拒建（与 wb-bridge add_task 同一套判定）。
+    $docText = "$Add`n$Note"
+    $looksLikeDoc = ($docText -match 'append-row|update-row|整理(腾讯文档)?主表|腾讯文档任务表') -or
+                    (($docText -match 'docs\.qq\.com') -and ($docText -match '追加|新增|写入|补写|整理|归档|移(到|入|出|至)'))
+    if ($looksLikeDoc) {
+        throw '拒绝建任务：这是腾讯文档操作指令。写表格请走文档同步队列（WorkBuddy 的 next_docsync / report_docsync），它不占任务行、不进终端。'
+    }
     $nextId = 1
     if ($tasks.Count -gt 0) {
         $maxId = 0

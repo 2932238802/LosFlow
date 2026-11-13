@@ -19,7 +19,7 @@ npm run build    # 产物 dist/，由 server.mjs 托管在 http://127.0.0.1:8899
 
 - **Authorize**：Claude Code 被拒的命令，批准后记账并自动重派
 - **Pool**：任务池，三条确认（细则/流程/授权）→ 拆分 → 推送到腾讯文档
-- **Claude Code**：`/events/claude` SSE 实时事件（init / say / tool / result / done）
+- **Claude Code**：`/events/losflow` 单条多路复用 SSE（run / line+seq / end），终端逐行增量渲染
 - **WorkBuddy**：`/events/workbuddy` SSE，MCP 调用流 + 当前执行中的任务
 - **Tasks**：任务表
 
