@@ -15,3 +15,6 @@ losflow.config.json
 
 # 日志
 *.log
+
+# WorkBuddy 调用日志（运行时产物）
+agent/wb-bridge/calls.jsonl
