@@ -1,0 +1,6 @@
+{
+  "wslDistro": "Ubuntu-26.04",
+  "wslRepo": "~/LosAngelous/Vesta",
+  "nodeExe": "node",
+  "dashboardPort": 8899
+}

@@ -1,0 +1,16 @@
+{
+  "name": "losflow",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "LosFlow — DSH 插件 + 工作流驾驶舱：任务池、派单、终端回放、授权队列、文档同步",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "build": "npm --prefix web run build",
+    "start": "node server/server.mjs",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

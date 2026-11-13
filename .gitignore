@@ -1,0 +1,17 @@
+# 依赖
+node_modules/
+
+# 构建产物
+web/dist/
+
+# 运行时数据：任务表、池子、台账、runs 归档、审批队列
+data/
+
+# 临时文件（派单正文等）
+.tmp/
+
+# 机器相关配置（WSL 发行版、node 路径、端口…）
+losflow.config.json
+
+# 日志
+*.log

@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "LosFlow cockpit",
+    "description": "Opens the LosFlow cockpit panel in the right Sidebar.",
+    "detail": "docs/DETAIL.md"
+  }
+}
